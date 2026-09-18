@@ -64,9 +64,9 @@ class EngineConfigTest(TestCase):
                 seq_size_per_block=1,
             )
 
-    def test_finalize_scheduler_config_rejects_hybrid_attention(self):
-        with self.assertRaisesRegex(ValueError, "hybrid"):
-            self._finalize(chunk_size=64, use_hybrid_attention=True)
+    def test_finalize_scheduler_config_allows_hybrid_attention(self):
+        cfg = self._finalize(chunk_size=64, use_hybrid_attention=True)
+        self.assertEqual(cfg.prefill_chunk_size, 64)
 
     def test_finalize_scheduler_config_disables_chunked_prefill_for_unsupported_role(
         self,
@@ -266,6 +266,59 @@ class MlaChunkedConfigTest(TestCase):
                 self.assertEqual(
                     engine.runtime_config.fifo_scheduler_config.prefill_chunk_size, 0
                 )
+
+
+class HybridChunkedConfigTest(TestCase):
+    setUp = MlaChunkedConfigTest.setUp
+    _make_configs = staticmethod(MlaChunkedConfigTest._make_configs)
+
+    def test_hybrid_config_boundaries(self):
+        from rtp_llm.ops import HybridAttentionType, SpeculativeType
+
+        for model_type in ("qwen3_next", "qwen35_dense", "qwen35_moe"):
+            for tp in (1, 2, 8, 16):
+                with self.subTest(model_type=model_type, tp=tp):
+                    engine, model = self._make_configs()
+                    model.attn_config.use_mla = False
+                    model.model_type = model_type
+                    model.hybrid_attention_config.enable_hybrid_attention = True
+                    model.hybrid_attention_config.hybrid_attention_types = [
+                        HybridAttentionType.LINEAR,
+                        HybridAttentionType.NONE,
+                    ]
+                    engine.parallelism_config.tp_size = tp
+                    engine.parallelism_config.world_size = tp
+                    self.update(engine, model)
+                    self.assertEqual(
+                        engine.runtime_config.fifo_scheduler_config.prefill_chunk_size,
+                        64,
+                    )
+
+        for block, kernel, kind, speculative, message in (
+            (32, 32, "qwen3_next", SpeculativeType.NONE, "multiples of 64"),
+            (128, 64, "qwen3_next", SpeculativeType.NONE, "logical/kernel"),
+            (64, 64, "kimi_linear", SpeculativeType.NONE, "Qwen"),
+            (64, 64, "qwen3_next", SpeculativeType.MTP, "speculative"),
+        ):
+            for enabled in (False, True):
+                with self.subTest(
+                    block=block, kernel=kernel, kind=kind, enabled=enabled
+                ):
+                    engine, model = self._make_configs()
+                    model.attn_config.use_mla = False
+                    model.model_type = kind
+                    model.hybrid_attention_config.enable_hybrid_attention = True
+                    model.attn_config.tokens_per_block = block
+                    model.attn_config.kernel_tokens_per_block = kernel
+                    engine.runtime_config.fifo_scheduler_config.prefill_chunk_size = (
+                        128 if enabled else 0
+                    )
+                    engine.sp_config.type = speculative
+                    if enabled:
+                        with self.assertRaisesRegex(ValueError, message):
+                            self.update(engine, model)
+                    else:
+                        self.update(engine, model)
 
 
 if __name__ == "__main__":

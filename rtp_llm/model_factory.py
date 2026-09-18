@@ -424,6 +424,7 @@ class ModelFactory:
             seq_size_per_block=model_config.attn_config.tokens_per_block,
         )
         ModelFactory._validate_mla_chunked_prefill(engine_config, model_config)
+        ModelFactory._validate_hybrid_chunked_prefill(engine_config, model_config)
         scheduler_config = engine_config.runtime_config.fifo_scheduler_config
         # Generic MoE executors allocate their fixed-capacity communication
         # buffers while the Python model is constructed. Preserve the finalized
@@ -475,6 +476,54 @@ class ModelFactory:
             if not supported:
                 raise ValueError(
                     f"MLA chunked prefill currently requires {requirement}; "
+                    "adjust this configuration or set prefill_chunk_size=0."
+                )
+
+    @staticmethod
+    def _validate_hybrid_chunked_prefill(
+        engine_config: EngineConfig, model_config: ModelConfig
+    ) -> None:
+        if (
+            not model_config.hybrid_attention_config.enable_hybrid_attention
+            or engine_config.runtime_config.fifo_scheduler_config.prefill_chunk_size
+            <= 0
+        ):
+            return
+
+        from rtp_llm.device.device_type import is_cuda
+
+        attn = model_config.attn_config
+        # These model types share Qwen3NextGatedDeltaNet's convolution/SSM
+        # load/store implementation. Other recurrent implementations need their
+        # own boundary contract before they can enter this path.
+        requirements = (
+            (is_cuda(), "the CUDA backend"),
+            (
+                model_config.model_type in ("qwen3_next", "qwen35_moe", "qwen35_dense"),
+                "the Qwen GatedDeltaNet implementation",
+            ),
+            (
+                attn.tokens_per_block >= 64
+                and attn.tokens_per_block % 64 == 0
+                and attn.kernel_tokens_per_block == attn.tokens_per_block,
+                "equal logical/kernel KV block sizes that are multiples of 64 "
+                "(GatedDeltaNet stores intermediate SSM states every 64 tokens)",
+            ),
+            (attn.kv_cache_dtype == KvCacheDataType.BASE, "BASE KV cache"),
+            (
+                engine_config.parallelism_config.prefill_cp_config.method
+                == CPRotateMethod.DISABLED,
+                "CP disabled",
+            ),
+            (
+                engine_config.sp_config.type == SpeculativeType.NONE,
+                "speculative decoding disabled",
+            ),
+        )
+        for supported, requirement in requirements:
+            if not supported:
+                raise ValueError(
+                    f"GatedDeltaNet chunked prefill requires {requirement}; "
                     "adjust this configuration or set prefill_chunk_size=0."
                 )
 

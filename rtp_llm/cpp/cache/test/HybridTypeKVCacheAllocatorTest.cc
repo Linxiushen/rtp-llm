@@ -1892,6 +1892,101 @@ TEST_F(HybridTypeKVCacheAllocatorTest, PrefillInitSkipsSparseCleanupAndPreserves
     EXPECT_FALSE(isNullBlockIdx(linear_out[4]));
 }
 
+// Chunk grants materialize sparse states inside an already reserved prompt.
+TEST_F(HybridTypeKVCacheAllocatorTest, ChunkBoundariesSurviveInterleaveCancelAndReallocate) {
+    auto config      = makeTinyHybridConfig();
+    config.block_num = 40;
+    auto allocator   = std::make_shared<TestHybridTypeKVCacheAllocator>(config, AllocationType::DEVICE);
+    ASSERT_TRUE(allocator->init());
+    const auto                           free_before = allocator->freeBlocksNum();
+    std::vector<BatchKVCacheResourcePtr> resources;
+    std::vector<CompleteTokenIdsPtr>     tokens;
+    std::vector<MallocInfo>              infos;
+    for (int request = 0; request < 2; ++request) {
+        resources.push_back(makeBatchResource(1, config, CacheKeysType{}));
+        tokens.push_back(makeCompleteTokenIds(1, 18, 4));
+        infos.push_back(MallocInfo{resources.back(), tokens.back()});
+        infos.back().reuse_cache                  = false;
+        infos.back().enable_cache_lookup          = false;
+        infos.back().enable_remove_skipped_blocks = false;
+        ASSERT_TRUE(allocator->malloc(infos.back()).success);
+        ASSERT_TRUE(isNullBlockIdx(resources.back()->blocks(0, 0)[0]));
+    }
+    const auto full0 = resources[0]->blocks(0, 1);
+    const auto full1 = resources[1]->blocks(0, 1);
+    // Block size 4 keeps this allocator test small; GPU coverage uses 64/128/130.
+    int prefix_len = 0;
+    for (int end : {4, 12, 16, 18}) {
+        for (int request : {1, 0}) {
+            const auto before                    = resources[request]->blocks(0, 0);
+            infos[request].incr_seq_len_override = end;
+            infos[request].prefill_prefix_len    = prefix_len;
+            ASSERT_TRUE(allocator->malloc(infos[request]).success);
+            const auto&  after    = resources[request]->blocks(0, 0);
+            const size_t boundary = (end - 1) / 4;
+            ASSERT_FALSE(isNullBlockIdx(after[boundary]));
+            for (size_t i = 0; i < before.size(); ++i) {
+                if (prefix_len > 0 && static_cast<int>(i) < (prefix_len - 1) / 4) {
+                    EXPECT_TRUE(isNullBlockIdx(after[i]));
+                } else if (!isNullBlockIdx(before[i])) {
+                    EXPECT_EQ(after[i], before[i]);
+                } else if (i != boundary) {
+                    EXPECT_TRUE(isNullBlockIdx(after[i]));
+                }
+            }
+            for (auto slot : resources[1 - request]->blocks(0, 0)) {
+                EXPECT_NE(after[boundary], slot);
+            }
+        }
+        prefix_len = end;
+    }
+    EXPECT_EQ(resources[0]->blocks(0, 1), full0);
+    EXPECT_EQ(resources[1]->blocks(0, 1), full1);
+    // Cancel without inserting uncomputed prompt suffixes into prefix reuse.
+    allocator->free(FreeInfo{resources[0], tokens[0]});
+    resources[0]                     = makeBatchResource(1, config, CacheKeysType{});
+    infos[0].batch_kv_cache_resource = resources[0];
+    infos[0].incr_seq_len_override   = -1;
+    infos[0].prefill_prefix_len      = 0;
+    ASSERT_TRUE(allocator->malloc(infos[0]).success);
+    EXPECT_TRUE(isNullBlockIdx(resources[0]->blocks(0, 0)[0]));
+    infos[0].incr_seq_len_override = 4;
+    ASSERT_TRUE(allocator->malloc(infos[0]).success);
+    EXPECT_FALSE(isNullBlockIdx(resources[0]->blocks(0, 0)[0]));
+    for (int request : {0, 1}) {
+        allocator->free(FreeInfo{resources[request], tokens[request]});
+    }
+    EXPECT_EQ(allocator->freeBlocksNum(), free_before);
+}
+
+TEST_F(HybridTypeKVCacheAllocatorTest, ChunkPrefillReclaimsObsoleteStatesBeforeAllocation) {
+    auto config    = makeTinyHybridConfig();  // 9 usable blocks: 6 full + at most 3 linear.
+    auto allocator = std::make_shared<TestHybridTypeKVCacheAllocator>(config, AllocationType::DEVICE);
+    ASSERT_TRUE(allocator->init());
+    auto       resource = makeBatchResource(1, config, CacheKeysType{});
+    auto       tokens   = makeCompleteTokenIds(1, 24, 4);
+    MallocInfo info{resource, tokens};
+    info.reuse_cache                  = false;
+    info.enable_cache_lookup          = false;
+    info.enable_remove_skipped_blocks = false;
+    ASSERT_TRUE(allocator->malloc(info).success);
+    EXPECT_EQ(allocator->freeBlocksNum(), 2u);
+    for (int prefix = 0; prefix < 24; prefix += 4) {
+        const auto before          = resource->blocks(0, 0);
+        info.prefill_prefix_len    = prefix;
+        info.incr_seq_len_override = prefix + 4;
+        ASSERT_TRUE(allocator->malloc(info).success) << "prefix=" << prefix;
+        const auto& after = resource->blocks(0, 0);
+        EXPECT_FALSE(isNullBlockIdx(after[prefix / 4]));
+        if (prefix > 0) {
+            EXPECT_EQ(after[prefix / 4 - 1], before[prefix / 4 - 1]);
+        }
+        EXPECT_LE(std::count_if(after.begin(), after.end(), [](auto id) { return !isNullBlockIdx(id); }), 3);
+    }
+    allocator->free(FreeInfo{resource, tokens});
+    EXPECT_EQ(allocator->freeBlocksNum(), 9u);
+}
+
 // Decode path (StreamCacheResource::incrKVBlock sets enable_remove_skipped_blocks=true).
 // The allocator is invoked on an already-populated resource, so malloc() dispatches directly
 // to incrMalloc(). Sparse cleanup must prune non-step blocks while preserving step hits and

@@ -28,6 +28,7 @@ def make_checkpoint(
     num_experts: int = 4,
     experts_per_token: int = 2,
     hidden_size: int = 256,
+    hybrid: bool = False,
 ):
     # Keep the original dense/no-Q-LoRA fixture as the quick regression.
     # FP8 MoE's native ep_gather requires hidden_size divisible by 512.
@@ -107,6 +108,84 @@ def make_checkpoint(
         weights[prefix + "self_attn.kv_a_layernorm.weight"] = torch.ones(
             512, dtype=torch.bfloat16, device="cpu"
         )
+    if hybrid:
+        config.update(
+            {
+                "architectures": ["Qwen3NextForCausalLM"],
+                "model_type": "qwen3_next",
+                "num_attention_heads": 4,
+                "num_key_value_heads": 4,
+                "head_dim": 64,
+                "rope_theta": 10000.0,
+                "partial_rotary_factor": 1.0,
+                "full_attention_interval": 2,
+                "linear_conv_kernel_dim": 4,
+                "linear_key_head_dim": 128,
+                "linear_value_head_dim": 128,
+                "linear_num_key_heads": 2,
+                "linear_num_value_heads": 2,
+                "num_experts": 2,
+                "num_experts_per_tok": 1,
+                "moe_intermediate_size": 512,
+                "shared_expert_intermediate_size": 0,
+                "rms_norm_eps": 1e-6,
+                "mamba_ssm_dtype": "float32",
+            }
+        )
+        (path / "config.json").write_text(json.dumps(config))
+        weights = {
+            key: value
+            for key, value in weights.items()
+            if not key.startswith("model.layers.")
+        }
+        weights["model.norm.weight"].zero_()
+        for layer in range(layers):
+            prefix = f"model.layers.{layer}."
+            for norm in ("input_layernorm", "post_attention_layernorm"):
+                weights[prefix + norm + ".weight"] = torch.zeros(
+                    hidden, dtype=torch.bfloat16
+                )
+            shapes = {"mlp.gate.weight": (2, hidden)}
+            for expert in range(2):
+                for name, shape in (
+                    ("gate_proj", (512, hidden)),
+                    ("up_proj", (512, hidden)),
+                    ("down_proj", (hidden, 512)),
+                ):
+                    shapes[f"mlp.experts.{expert}.{name}.weight"] = shape
+            if layer == 0:
+                shapes.update(
+                    {
+                        "linear_attn.in_proj_qkvz.weight": (1024, hidden),
+                        "linear_attn.in_proj_ba.weight": (4, hidden),
+                        "linear_attn.conv1d.weight": (768, 1, 4),
+                        "linear_attn.out_proj.weight": (hidden, 256),
+                    }
+                )
+                weights[prefix + "linear_attn.norm.weight"] = torch.ones(
+                    128, dtype=torch.bfloat16
+                )
+                weights[prefix + "linear_attn.A_log"] = torch.zeros(
+                    2, dtype=torch.float32
+                )
+                weights[prefix + "linear_attn.dt_bias"] = torch.zeros(
+                    2, dtype=torch.bfloat16
+                )
+            else:
+                shapes.update(
+                    {
+                        "self_attn.q_proj.weight": (512, hidden),
+                        "self_attn.k_proj.weight": (256, hidden),
+                        "self_attn.v_proj.weight": (256, hidden),
+                        "self_attn.o_proj.weight": (hidden, 256),
+                    }
+                )
+                for norm in ("q_norm", "k_norm"):
+                    weights[prefix + "self_attn." + norm + ".weight"] = torch.zeros(
+                        64, dtype=torch.bfloat16
+                    )
+            for name, shape in shapes.items():
+                weights[prefix + name] = weight(*shape)
     save_file(weights, str(path / "model.safetensors"))
     vocabulary = {"[UNK]": 0, "[BOS]": 1, "[EOS]": 2}
     vocabulary.update({f"t{i}": i for i in range(3, vocab)})
@@ -233,6 +312,7 @@ class ChunkedMlaEngineTest(unittest.TestCase):
         return frames if return_frames else [frame["output_ids"] for frame in frames]
 
     def test_full_vs_chunked_prefill_and_decode(self):
+        model_type = os.environ.get("CHUNK_TEST_MODEL_TYPE", "deepseek2")
         tp_size = int(os.environ.get("MLA_TEST_TP_SIZE", "1"))
         dp_size = int(os.environ.get("MLA_TEST_DP_SIZE", "1"))
         ep_size = int(os.environ.get("MLA_TEST_EP_SIZE", "1"))
@@ -253,6 +333,7 @@ class ChunkedMlaEngineTest(unittest.TestCase):
             if directory == generated_directory:
                 make_checkpoint(
                     Path(directory),
+                    hybrid=model_type == "qwen3_next",
                     q_lora_rank=int(os.environ.get("MLA_TEST_Q_LORA_RANK", "0")),
                     moe=os.environ.get("MLA_TEST_MOE", "0") == "1",
                     num_experts=int(os.environ.get("MLA_TEST_MOE_EXPERTS", "4")),
@@ -264,7 +345,7 @@ class ChunkedMlaEngineTest(unittest.TestCase):
                 self.assertTrue((Path(directory) / "config.json").is_file())
                 # Use the service's post-processor/BOS compatibility handling.
                 self.tokenizer = TokenizerFactory.create(
-                    directory, directory, "deepseek2"
+                    directory, directory, model_type
                 )
             reference = {}
             check_reuse = os.environ.get("MLA_TEST_CACHE_REUSE", "0") == "1"
@@ -341,7 +422,7 @@ class ChunkedMlaEngineTest(unittest.TestCase):
                         manager.start_server(
                             model_path=directory,
                             tokenizer_path=directory,
-                            model_type="deepseek2",
+                            model_type=model_type,
                             timeout=300,
                         )
                     )

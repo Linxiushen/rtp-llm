@@ -235,7 +235,7 @@ void GenerateStream::fakeInitKVBlock(size_t reserved_blocks) {
 absl::Status GenerateStream::incrKVBlock() {
     RTP_LLM_PROFILE_FUNCTION();
     std::lock_guard<std::mutex> lock(*mutex_);
-    return stream_cache_resource_->incrKVBlock();
+    return stream_cache_resource_->incrKVBlock(useChunkWindow() ? reuseLength() + currentChunkLen() : -1);
 }
 
 void GenerateStream::releaseResource() {
