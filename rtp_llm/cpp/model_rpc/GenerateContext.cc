@@ -157,7 +157,8 @@ void GenerateContext::stopStream() {
                 RTP_LLM_LOG_WARNING("request [%s] stopping stream with terminal source=client_cancel",
                                     request_key.c_str());
                 stream_->reportError(ErrorCode::CANCELLED, "request cancelled by client");
-            } else {
+            } else if (!stream_->hasEvent(StreamEvents::GenerateDone)) {
+                // The final output may drain before the scheduler commits FINISHED.
                 RTP_LLM_LOG_WARNING("request [%s] stopping unfinished stream with terminal source=context_cleanup",
                                     request_key.c_str());
                 stream_->reportError(ErrorCode::CANCELLED, "context cleanup before stream finished");

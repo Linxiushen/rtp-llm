@@ -469,6 +469,39 @@ TEST(RpcWriterCancellationTest, PrefillStageSettlementIsIdempotent) {
     EXPECT_EQ(stat_info.enqueue_request_rt_us, 0);
 }
 
+TEST(RpcWriterCancellationTest, ContextCleanupPreservesGenerationDoneBeforeSchedulerTransition) {
+    auto                         stream = std::make_shared<SingleOutputStream>();
+    auto                         meta   = std::make_shared<RpcServerRuntimeMeta>();
+    kmonitor::MetricsReporterPtr metrics_reporter;
+    stream->generate_status_->status.store(StreamState::RUNNING);
+    stream->reportEvent(StreamEvents::GenerateDone);
+    ASSERT_EQ(stream->getStatus(), StreamState::RUNNING);
+    ASSERT_FALSE(stream->hasError());
+
+    test::TestLogCapture capture("generation_done_context_cleanup");
+    auto&                logger         = Logger::getEngineLogger();
+    const auto           previous_level = logger.base_log_level_;
+    logger.setBaseLevel(alog::LOG_LEVEL_DEBUG);
+    std::thread cleanup([&] {
+        GenerateContext context(52, 0, nullptr, metrics_reporter, meta);
+        context.setStream(stream);
+    });
+
+    // Synchronize after the cleanup decision and before the scheduler consumes
+    // GenerateDone. Do not let a fast scheduler hide the erroneous cancellation.
+    const bool waiting = capture.waitFor("waiting stream [41] running done to cancel");
+    stream->moveToNext();
+    cleanup.join();
+    logger.setBaseLevel(previous_level);
+
+    ASSERT_TRUE(waiting);
+    EXPECT_EQ(stream->getStatus(), StreamState::FINISHED);
+    EXPECT_FALSE(stream->hasError());
+    const auto schedule_info = meta->getEngineScheduleInfo(/*latest_finished_version=*/-1);
+    ASSERT_EQ(schedule_info.finished_task_info_list.size(), 1);
+    EXPECT_EQ(schedule_info.finished_task_info_list[0].error_code, static_cast<int64_t>(ErrorCode::NONE_ERROR));
+}
+
 TEST(RpcWriterCancellationTest, ContextCleanupPropagatesSpecificTerminalError) {
     auto                         stream = std::make_shared<SingleOutputStream>();
     auto                         meta   = std::make_shared<RpcServerRuntimeMeta>();

@@ -2,6 +2,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
+from rtp_llm.config.quant_config import Fp8BlockWiseQuantConfig
 from rtp_llm.models_py.modules.base.common.kvcache_store import WriteCacheStoreOp
 from rtp_llm.models_py.modules.factory.attention import common
 from rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.mla_kv_cache_write_op import (
@@ -193,6 +194,10 @@ class MlaFlashInferPrefillImpl(MlaFlashInferImplBase):
             q_len < self.absorb_opt_len
             and self.has_reuse_cache
             and attn_configs.kv_cache_dtype == KvCacheDataType.BASE
+            # FP8 KV-B quantizes CKV before the projection. BF16 absorb omits
+            # that operation and may use different load-time weights, so prefix
+            # prefill must retain the same quantized path as full prefill.
+            and not isinstance(quant_config, Fp8BlockWiseQuantConfig)
         ):
             self.absorb_fmha = MlaFlashInferDecodeOp(
                 attn_configs.head_num,

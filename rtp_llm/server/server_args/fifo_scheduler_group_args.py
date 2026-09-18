@@ -77,7 +77,12 @@ def init_fifo_scheduler_group_args(parser, fifo_scheduler_config):
         type=int,
         default=0,
         help="chunked prefill 单次 PREFILL forward 的总 token 预算，由所有真实 context row 共享。"
-            ">0 时启用，并自动按 KV cache block 大小对齐。"
-            "仅支持 PREFILL / PDFUSION 角色，且不支持 MLA 或线性注意力模型。"
-            "使用 force_batch、beam、logits、loss、hidden_states、all_probs 或多模态输入的请求将被拒绝。",
+        ">0 时启用，并自动按 KV cache block 大小对齐。"
+        "仅支持 PREFILL / PDFUSION 角色，支持普通 attention 和普通 MLA，暂不支持线性注意力模型。"
+        "MLA 当前支持 CUDA FlashInfer、非稀疏、BF16 计算/BF16 KV；"
+        "权重量化沿用模型/backend 的原生约束。"
+        "TP 和 KV block 遵循模型/backend 的原生约束；"
+        "CP/投机解码关闭，使用 PDFUSION 或 PREFILL。"
+        "MLA prefill 使用 eager，decode 可用 CUDA Graph，仍须满足模型/MoE/backend 的原生 Graph 条件。"
+        "使用 force_batch、beam、logits、loss、hidden_states、all_probs 或多模态输入的请求将被拒绝。",
     )

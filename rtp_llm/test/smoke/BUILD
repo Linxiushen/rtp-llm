@@ -1,5 +1,94 @@
 package(default_visibility = ["//visibility:public"])
 
+py_test(
+    name = "chunked_mla_engine_test",
+    srcs = ["chunked_mla_engine_test.py"],
+    deps = [
+        "//rtp_llm:testlib",
+        "//rtp_llm/test/utils:maga_server_manager",
+    ],
+    tags = ["open_skip"],
+    exec_properties = {"gpu": "A10"},
+)
+
+py_test(
+    name = "chunked_mla_engine_tp2_test",
+    srcs = ["chunked_mla_engine_test.py"],
+    main = "chunked_mla_engine_test.py",
+    deps = [
+        "//rtp_llm:testlib",
+        "//rtp_llm/test/utils:maga_server_manager",
+    ],
+    env = {"MLA_TEST_TP_SIZE": "2", "GPU_COUNT": "2"},
+    tags = ["open_skip"],
+    exec_properties = {"gpu": "A10", "gpu_count": "2"},
+)
+
+py_test(
+    name = "chunked_mla_q_lora_moe_tp2_test",
+    srcs = ["chunked_mla_engine_test.py"],
+    main = "chunked_mla_engine_test.py",
+    deps = [
+        "//rtp_llm:testlib",
+        "//rtp_llm/test/utils:maga_server_manager",
+    ],
+    env = {"MLA_TEST_Q_LORA_RANK": "128", "MLA_TEST_MOE": "1", "MLA_TEST_TP_SIZE": "2", "GPU_COUNT": "2"},
+    tags = ["open_skip"],
+    exec_properties = {"gpu": "A10", "gpu_count": "2"},
+)
+
+py_test(
+    name = "chunked_mla_graph_tp2_test",
+    srcs = ["chunked_mla_engine_test.py"],
+    main = "chunked_mla_engine_test.py",
+    deps = [
+        "//rtp_llm:testlib",
+        "//rtp_llm/test/utils:maga_server_manager",
+    ],
+    env = {
+        "MLA_TEST_CUDA_GRAPH": "1",
+        "MLA_TEST_CACHE_REUSE": "1",
+        "MLA_TEST_TP_SIZE": "2",
+        "GPU_COUNT": "2",
+    },
+    tags = ["open_skip"],
+    exec_properties = {"gpu": "A10", "gpu_count": "2"},
+)
+
+py_test(
+    name = "chunked_mla_fp8_weight_reuse_tp2_test",
+    srcs = ["chunked_mla_engine_test.py"],
+    main = "chunked_mla_engine_test.py",
+    deps = [
+        "//rtp_llm:testlib",
+        "//rtp_llm/test/utils:maga_server_manager",
+    ],
+    env = {
+        "MLA_TEST_HIDDEN_SIZE": "512",
+        "MLA_TEST_Q_LORA_RANK": "128",
+        "MLA_TEST_MOE": "1",
+        "MLA_TEST_QUANTIZATION": "FP8_PER_BLOCK",
+        "MLA_TEST_FP8_KV_CACHE": "0",
+        "MLA_TEST_CACHE_REUSE": "1",
+        "MLA_TEST_TP_SIZE": "2",
+        "GPU_COUNT": "2",
+    },
+    tags = ["open_skip"],
+    exec_properties = {"gpu": "H20", "gpu_count": "2"},
+)
+
+py_test(
+    name = "chunked_mla_cache_lifecycle_test",
+    srcs = ["chunked_mla_cache_lifecycle_test.py", "chunked_mla_engine_test.py"],
+    main = "chunked_mla_cache_lifecycle_test.py",
+    deps = [
+        "//rtp_llm:testlib",
+        "//rtp_llm/test/utils:maga_server_manager",
+    ],
+    tags = ["open_skip"],
+    exec_properties = {"gpu": "A10"},
+)
+
 # Framework source files for cross-package smoke tests.
 # Used as data dep (not srcs/deps) so internal smoke targets can merge their
 # own smoke/ children through smoke.__path__ without duplicating runner srcs.

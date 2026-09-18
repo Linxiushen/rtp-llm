@@ -22,8 +22,8 @@ from rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.flashinfer_mla_wr
     MlaFlashInferPrefillImpl,
 )
 from rtp_llm.models_py.modules.hybrid.test.mla_attention_ref import attention_ref
-from rtp_llm.ops import ParallelismConfig, compute_ops
-from rtp_llm.ops.compute_ops import LayerKVCache, PyAttentionInputs
+from rtp_llm.ops import FMHAConfig, ParallelismConfig, compute_ops
+from rtp_llm.ops.compute_ops import LayerKVCache, PyAttentionInputs, rtp_llm_ops
 from rtp_llm.utils.model_weight import W
 
 
@@ -359,6 +359,433 @@ class MLATest(TestCase):
                 reuse_len=params[3],
             ):
                 self._run_mla_test(*params)
+
+    @staticmethod
+    def _chunk_inputs(lengths, prefixes, blocks):
+        inputs = PyAttentionInputs()
+        inputs.is_prefill = True
+        inputs.input_lengths = torch.tensor(lengths, dtype=torch.int32, device="cpu")
+        inputs.prefix_lengths = torch.tensor(prefixes, dtype=torch.int32, device="cpu")
+        inputs.sequence_lengths = torch.empty(0, dtype=torch.int32, device="cpu")
+        inputs.kv_cache_block_id = torch.tensor(blocks, dtype=torch.int32, device="cpu")
+        inputs.kv_cache_block_id_device = inputs.kv_cache_block_id.to(device)
+        inputs.kv_cache_kernel_block_id = inputs.kv_cache_block_id
+        inputs.kv_cache_kernel_block_id_device = inputs.kv_cache_block_id_device
+        return inputs
+
+    def test_chunk_metadata(self):
+        params = rtp_llm_ops.FlashInferMlaAttnParams()
+        # Reuse one params object, including a growing then shrinking batch.
+        cases = [
+            ([64], [0], [[5, 2, 9]], [0, 64], [64], list(range(320, 384))),
+            ([64], [64], [[5, 2, 9]], [0, 64], [128], list(range(128, 192))),
+            (
+                [64, 2],
+                [64, 128],
+                [[5, 2, 9], [1, 3, 7]],
+                [0, 64, 66],
+                [128, 130],
+                list(range(128, 192)) + [448, 449],
+            ),
+            ([2], [128], [[5, 2, 9]], [0, 2], [130], [576, 577]),
+        ]
+        for lengths, prefixes, blocks, q_indptr, kv_lengths, slots in cases:
+            with self.subTest(lengths=lengths, prefixes=prefixes):
+                inputs = self._chunk_inputs(lengths, prefixes, blocks)
+                params.fill_params(
+                    inputs.prefix_lengths,
+                    inputs.sequence_lengths,
+                    inputs.input_lengths,
+                    inputs.kv_cache_kernel_block_id,
+                    64,
+                )
+                self.assertEqual(params.qo_indptr_h.tolist(), q_indptr)
+                self.assertEqual(params.kvlen_h.tolist(), kv_lengths)
+                self.assertEqual(
+                    params.prefill_ragged_kv_len_indptr_d.cpu().tolist(),
+                    [0] + list(itertools.accumulate(kv_lengths)),
+                )
+                self.assertEqual(params.slot_mapping.cpu().tolist(), slots)
+                positions = [p + i for p, n in zip(prefixes, lengths) for i in range(n)]
+                self.assertEqual(params.positions_h.tolist(), positions)
+
+    def _chunk_fixture(self):
+        config = ModelConfig()
+        attn = config.attn_config
+        attn.head_num = 16
+        attn.nope_head_dim = 128
+        attn.rope_head_dim = 64
+        attn.kv_lora_rank = 512
+        attn.v_head_dim = 128
+        attn.size_per_head = 192
+        attn.tokens_per_block = attn.kernel_tokens_per_block = 64
+        attn.use_mla = True
+        config.hidden_size = 2048
+        torch.manual_seed(17)
+        weights = self._create_weights(config, config.hidden_size)
+        # Fan-in scaling keeps logits and raw outputs in the usual BF16 range.
+        for name in (W.mla_kv_b_w, W.mla_kc, W.mla_vc):
+            weights[name] = weights[name] / math.sqrt(attn.kv_lora_rank)
+        cos_sin = create_cos_sin_cache()
+        return attn, weights, cos_sin
+
+    def test_chunked_forward(self):
+        attn, weights, cos_sin = self._chunk_fixture()
+        for length, budget, absorb_len in itertools.chain(
+            itertools.product(
+                (1, 63, 64, 65, 127, 128, 129, 130, 257, 1025),
+                (64, 128, 256),
+                (0, 1024),
+            ),
+            # With a cached prefix, final Q lengths straddle the absorb threshold.
+            ((2047, 1024, 1024), (2048, 1024, 1024), (3073, 2048, 1024)),
+        ):
+            with self.subTest(length=length, budget=budget, absorb_len=absorb_len):
+                page_count = math.ceil(length / 64)
+                # Fragmented physical pages, with unowned pages between them.
+                blocks = [5, 2, 9] + list(range(11, 11 + max(0, page_count - 3)))
+                blocks = blocks[:page_count]
+                q = torch.randn(length, 16, 192, dtype=torch.bfloat16, device=device)
+                ckv = torch.randn(length, 512, dtype=torch.bfloat16, device=device)
+                kpe = torch.randn(length, 64, dtype=torch.bfloat16, device=device)
+                reference_cache = LayerKVCache()
+                reference_cache.kv_cache_base = torch.full(
+                    (max(blocks) + 2, 64, 576), -7, dtype=torch.bfloat16, device=device
+                )
+                chunk_cache = LayerKVCache()
+                chunk_cache.kv_cache_base = reference_cache.kv_cache_base.clone()
+                fmha = FMHAConfig()
+                fmha.absorb_opt_len = absorb_len
+                reference_impl = MlaFlashInferPrefillImpl(
+                    attn,
+                    self._chunk_inputs([length], [0], [blocks]),
+                    [weights],
+                    cos_sin,
+                    fmha_config=fmha,
+                )
+                reference = reference_impl.forward(
+                    q.clone(), ckv, kpe.clone(), reference_cache, 0
+                )
+                outputs = []
+                written = torch.zeros(
+                    chunk_cache.kv_cache_base.shape[:2], dtype=torch.bool, device=device
+                )
+                for start in range(0, length, budget):
+                    end = min(start + budget, length)
+                    before = chunk_cache.kv_cache_base.clone()
+                    impl = MlaFlashInferPrefillImpl(
+                        attn,
+                        self._chunk_inputs([end - start], [start], [blocks]),
+                        [weights],
+                        cos_sin,
+                        fmha_config=fmha,
+                    )
+                    self.assertEqual(
+                        impl.absorb_fmha is not None,
+                        start > 0 and end - start < absorb_len,
+                    )
+                    outputs.append(
+                        impl.forward(
+                            q[start:end].clone(),
+                            ckv[start:end],
+                            kpe[start:end].clone(),
+                            chunk_cache,
+                            0,
+                        )
+                    )
+                    current = torch.zeros_like(written)
+                    for pos in range(start, end):
+                        current[blocks[pos // 64], pos % 64] = True
+                    torch.testing.assert_close(
+                        chunk_cache.kv_cache_base[~current],
+                        before[~current],
+                        rtol=0,
+                        atol=0,
+                    )
+                    written |= current
+                    torch.testing.assert_close(
+                        chunk_cache.kv_cache_base[written],
+                        reference_cache.kv_cache_base[written],
+                        rtol=0,
+                        atol=0,
+                    )
+                # Compare raw values, including amplitude, not normalized directions.
+                torch.testing.assert_close(
+                    torch.cat(outputs), reference, rtol=0.01, atol=0.01
+                )
+
+    def test_fp8_weight_prefill_keeps_quantized_kv_projection(self):
+        from rtp_llm.config.quant_config import init_quant_config
+        from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import (
+            is_deep_gemm_e8m0_used,
+        )
+        from rtp_llm.models_py.kernels.cuda.fp8_kernel import requant_weight_ue8m0
+        from rtp_llm.test.utils.numeric_util import per_block_cast_to_fp8
+
+        attn, weights, cos_sin = self._chunk_fixture()
+        quant = init_quant_config("FP8_PER_BLOCK")
+        # Match load-time quantization: KV-B is quantized, while the absorbed
+        # matrices keep the original BF16 checkpoint values.
+        weight = weights[W.mla_kv_b_w].t().contiguous()
+        quant_weight, scales = per_block_cast_to_fp8(weight, use_ue8m0=False)
+        if is_deep_gemm_e8m0_used():
+            quant_weight, scales = requant_weight_ue8m0(quant_weight, scales)
+        else:
+            quant_weight = quant_weight.reshape(weight.shape[1], weight.shape[0])
+            scales = scales.reshape(scales.shape[1], scales.shape[0])
+        weights[W.mla_kv_b_w] = quant_weight
+        weights[W.mla_kv_b_s] = scales
+        fmha = FMHAConfig()
+        fmha.absorb_opt_len = 4096
+        for length, budget in itertools.product((130, 257), (64, 128)):
+            with self.subTest(length=length, budget=budget):
+                blocks = [5, 2, 9, 1, 7][: math.ceil(length / 64)]
+                q = torch.randn(length, 16, 192, dtype=torch.bfloat16, device=device)
+                ckv = torch.randn(length, 512, dtype=torch.bfloat16, device=device)
+                kpe = torch.randn(length, 64, dtype=torch.bfloat16, device=device)
+
+                def cache():
+                    result = LayerKVCache()
+                    result.kv_cache_base = torch.full(
+                        (12, 64, 576), -7, dtype=torch.bfloat16, device=device
+                    )
+                    return result
+
+                reference_cache = cache()
+                reference_impl = MlaFlashInferPrefillImpl(
+                    attn,
+                    self._chunk_inputs([length], [0], [blocks]),
+                    [weights],
+                    cos_sin,
+                    fmha_config=fmha,
+                    quant_config=quant,
+                )
+                reference = reference_impl.forward(
+                    q.clone(), ckv, kpe.clone(), reference_cache, 0
+                )
+                chunk_cache = cache()
+                outputs = []
+                for start in range(0, length, budget):
+                    end = min(start + budget, length)
+                    impl = MlaFlashInferPrefillImpl(
+                        attn,
+                        self._chunk_inputs([end - start], [start], [blocks]),
+                        [weights],
+                        cos_sin,
+                        fmha_config=fmha,
+                        quant_config=quant,
+                    )
+                    self.assertIsNone(
+                        impl.absorb_fmha,
+                        "FP8 KV-B activation quantization cannot be absorbed into BF16 weights",
+                    )
+                    before = chunk_cache.kv_cache_base.clone()
+                    outputs.append(
+                        impl.forward(
+                            q[start:end].clone(),
+                            ckv[start:end],
+                            kpe[start:end].clone(),
+                            chunk_cache,
+                            0,
+                        )
+                    )
+                    slots = torch.tensor(
+                        [blocks[p // 64] * 64 + p % 64 for p in range(start, end)],
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    flat = chunk_cache.kv_cache_base.reshape(-1, 576)
+                    keep = torch.ones(flat.shape[0], dtype=torch.bool, device=device)
+                    keep[slots] = False
+                    self.assertTrue(
+                        torch.equal(
+                            flat[slots],
+                            reference_cache.kv_cache_base.reshape(-1, 576)[slots],
+                        )
+                    )
+                    self.assertTrue(
+                        torch.equal(
+                            flat[keep].view(torch.uint8),
+                            before.reshape(-1, 576)[keep].view(torch.uint8),
+                        )
+                    )
+                torch.testing.assert_close(
+                    torch.cat(outputs), reference, atol=0.01, rtol=0.01
+                )
+
+    def test_native_block_sizes_and_causal_suffix(self):
+        for block_size, absorb_len in itertools.product((32, 64, 128), (0, 1024)):
+            with self.subTest(block_size=block_size, absorb_len=absorb_len):
+                attn, weights, cos_sin = self._chunk_fixture()
+                attn.tokens_per_block = attn.kernel_tokens_per_block = block_size
+                length = 2 * block_size + 2
+                blocks = [5, 2, 9]
+                q = torch.randn(length, 16, 192, dtype=torch.bfloat16, device=device)
+                ckv = torch.randn(length, 512, dtype=torch.bfloat16, device=device)
+                kpe = torch.randn(length, 64, dtype=torch.bfloat16, device=device)
+                fmha = FMHAConfig()
+                fmha.absorb_opt_len = absorb_len
+
+                def cache():
+                    result = LayerKVCache()
+                    result.kv_cache_base = torch.full(
+                        (11, block_size, 576), -7, dtype=torch.bfloat16, device=device
+                    )
+                    return result
+
+                def forward(start, end, q_input, ckv_input, kpe_input, kv):
+                    impl = MlaFlashInferPrefillImpl(
+                        attn,
+                        self._chunk_inputs([end - start], [start], [blocks]),
+                        [weights],
+                        cos_sin,
+                        fmha_config=fmha,
+                    )
+                    expected_slots = [
+                        blocks[p // block_size] * block_size + p % block_size
+                        for p in range(start, end)
+                    ]
+                    self.assertEqual(
+                        impl.fmha_params.slot_mapping.cpu().tolist(), expected_slots
+                    )
+                    return impl.forward(
+                        q_input.clone(), ckv_input.clone(), kpe_input.clone(), kv, 0
+                    )
+
+                reference_cache = cache()
+                reference = forward(0, length, q, ckv, kpe, reference_cache)
+                actual_cache = cache()
+                outputs = []
+                for start in range(0, length, block_size):
+                    end = min(start + block_size, length)
+                    before = actual_cache.kv_cache_base.clone()
+                    outputs.append(
+                        forward(
+                            start,
+                            end,
+                            q[start:end],
+                            ckv[start:end],
+                            kpe[start:end],
+                            actual_cache,
+                        )
+                    )
+                    written = torch.zeros(
+                        (11, block_size), dtype=torch.bool, device=device
+                    )
+                    for pos in range(start, end):
+                        written[blocks[pos // block_size], pos % block_size] = True
+                    torch.testing.assert_close(
+                        actual_cache.kv_cache_base[~written],
+                        before[~written],
+                        atol=0,
+                        rtol=0,
+                    )
+                    torch.testing.assert_close(
+                        actual_cache.kv_cache_base[written],
+                        reference_cache.kv_cache_base[written],
+                        atol=0,
+                        rtol=0,
+                    )
+                torch.testing.assert_close(
+                    torch.cat(outputs), reference, atol=0.01, rtol=0.01
+                )
+
+                # Future KV must not affect queries before the changed suffix.
+                future_q, future_ckv, future_kpe = q.clone(), ckv.clone(), kpe.clone()
+                future_q[block_size:] = -future_q[block_size:]
+                future_ckv[block_size:] = -future_ckv[block_size:]
+                future_kpe[block_size:] = -future_kpe[block_size:]
+                changed = forward(0, length, future_q, future_ckv, future_kpe, cache())
+                torch.testing.assert_close(
+                    changed[:block_size], reference[:block_size], atol=0.01, rtol=0.01
+                )
+
+    def test_chunked_batched_forward(self):
+        attn, weights, cos_sin = self._chunk_fixture()
+        lengths = (130, 193)
+        blocks = ([5, 2, 9, 0], [1, 4, 8, 7])
+        queries = [
+            torch.randn(n, 16, 192, dtype=torch.bfloat16, device=device)
+            for n in lengths
+        ]
+        compressed = [
+            torch.randn(n, 512, dtype=torch.bfloat16, device=device) for n in lengths
+        ]
+        keys = [
+            torch.randn(n, 64, dtype=torch.bfloat16, device=device) for n in lengths
+        ]
+        for absorb_len in (0, 1024):
+            with self.subTest(absorb_len=absorb_len):
+                fmha = FMHAConfig()
+                fmha.absorb_opt_len = absorb_len
+                cache = LayerKVCache()
+                cache.kv_cache_base = torch.full(
+                    (11, 64, 576), -7, dtype=torch.bfloat16, device=device
+                )
+                reference_cache = LayerKVCache()
+                reference_cache.kv_cache_base = cache.kv_cache_base.clone()
+                references = []
+                for row, length in enumerate(lengths):
+                    impl = MlaFlashInferPrefillImpl(
+                        attn,
+                        self._chunk_inputs([length], [0], [blocks[row]]),
+                        [weights],
+                        cos_sin,
+                        fmha_config=fmha,
+                    )
+                    references.append(
+                        impl.forward(
+                            queries[row].clone(),
+                            compressed[row],
+                            keys[row].clone(),
+                            reference_cache,
+                            0,
+                        )
+                    )
+                prefixes = [0, 0]
+                # Vary grants and batch membership; the third call has different prefixes.
+                for batch in (
+                    [(0, 64), (1, 64)],
+                    [(1, 128)],
+                    [(1, 1), (0, 64)],
+                    [(0, 2)],
+                ):
+                    inputs = self._chunk_inputs(
+                        [n for _, n in batch],
+                        [prefixes[row] for row, _ in batch],
+                        [blocks[row] for row, _ in batch],
+                    )
+                    impl = MlaFlashInferPrefillImpl(
+                        attn, inputs, [weights], cos_sin, fmha_config=fmha
+                    )
+                    slices = [
+                        (row, slice(prefixes[row], prefixes[row] + n))
+                        for row, n in batch
+                    ]
+                    before = cache.kv_cache_base.clone()
+                    output = impl.forward(
+                        torch.cat([queries[row][s] for row, s in slices]),
+                        torch.cat([compressed[row][s] for row, s in slices]),
+                        torch.cat([keys[row][s] for row, s in slices]),
+                        cache,
+                        0,
+                    )
+                    expected = torch.cat([references[row][s] for row, s in slices])
+                    torch.testing.assert_close(output, expected, atol=0.01, rtol=0.01)
+                    written = torch.zeros((11, 64), dtype=torch.bool, device=device)
+                    for row, count in batch:
+                        for pos in range(prefixes[row], prefixes[row] + count):
+                            written[blocks[row][pos // 64], pos % 64] = True
+                        prefixes[row] += count
+                    torch.testing.assert_close(
+                        cache.kv_cache_base[~written], before[~written], atol=0, rtol=0
+                    )
+                    torch.testing.assert_close(
+                        cache.kv_cache_base[written],
+                        reference_cache.kv_cache_base[written],
+                        atol=0,
+                        rtol=0,
+                    )
 
 
 if __name__ == "__main__":

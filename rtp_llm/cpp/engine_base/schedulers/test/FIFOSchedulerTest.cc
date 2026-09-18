@@ -4643,6 +4643,10 @@ static void verifyGlobalChunkBudgetFourRoundPrefix(RoleType role_type, const std
     auto s3 = env.makeStream({3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21});
     auto s4 = env.makeStream({20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
                               36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50});
+    // Inject the simulated cache result after allocation, just as a completed
+    // cache load does; initial allocation publishes its own reuse length.
+    ASSERT_TRUE(s3->initKVBlock().ok());
+    s3->reportEvent(StreamEvents::LoadInitiated);
     s3->setReuseLength(4);
     ASSERT_TRUE(scheduler.enqueue(s1).ok());
     ASSERT_TRUE(scheduler.enqueue(s2).ok());
@@ -4689,6 +4693,8 @@ TEST_F(FIFOSchedulerTest, testGlobalChunkBudgetDefersFanoutProgressCheckUntilReu
 
     // Cache allocation/loading happens after enqueue in production. Set the resulting
     // block-aligned reuse here to exercise the scheduler boundary directly.
+    ASSERT_TRUE(cached_stream->initKVBlock().ok());
+    cached_stream->reportEvent(StreamEvents::LoadInitiated);
     cached_stream->setReuseLength(4);
 
     auto batch = scheduler.schedule();
@@ -4714,6 +4720,8 @@ TEST_F(FIFOSchedulerTest, testGlobalChunkBudgetValidatesFanoutReuseAndShortFinal
     ASSERT_EQ(env.cache_manager->freeBlocksNum(), free_blocks_before);
 
     auto unaligned_stream = env.makeStream({6, 7, 8, 9, 10, 11, 12, 13, 14});
+    ASSERT_TRUE(unaligned_stream->initKVBlock().ok());
+    unaligned_stream->reportEvent(StreamEvents::LoadInitiated);
     unaligned_stream->setReuseLength(1);
     ASSERT_TRUE(scheduler.enqueue(unaligned_stream).ok());
 

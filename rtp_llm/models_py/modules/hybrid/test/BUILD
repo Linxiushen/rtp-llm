@@ -32,6 +32,8 @@ py_test (
 py_test (
     name = "mla_reuse_cache_test",
     srcs = ["mla_reuse_cache_test.py", "mla_attention_ref.py"],
+    # FP8 projection tests reuse the per-user DeepGEMM JIT cache.
+    env_inherit = ["HOME"],
     deps = py_test_deps + [
         "//rtp_llm:testlib",
     ] + select({

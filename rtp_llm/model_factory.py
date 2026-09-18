@@ -26,6 +26,8 @@ from rtp_llm.config.py_config_modules import (
 from rtp_llm.device.device_type import is_hip
 from rtp_llm.model_factory_register import _model_factory, ensure_model_registered
 from rtp_llm.ops import (
+    CPRotateMethod,
+    KvCacheDataType,
     ProfilingDebugLoggingConfig,
     SpeculativeType,
     TaskType,
@@ -416,12 +418,12 @@ class ModelFactory:
         finalize_scheduler_config(
             fifo_scheduler_config=engine_config.runtime_config.fifo_scheduler_config,
             max_seq_len=model_config.max_seq_len,
-            use_mla=model_config.attn_config.use_mla,
             use_hybrid_attention=model_config.hybrid_attention_config.enable_hybrid_attention,
             role_type=engine_config.pd_sep_config.role_type,
             use_batch_decode_scheduler=engine_config.runtime_config.use_batch_decode_scheduler,
             seq_size_per_block=model_config.attn_config.tokens_per_block,
         )
+        ModelFactory._validate_mla_chunked_prefill(engine_config, model_config)
         scheduler_config = engine_config.runtime_config.fifo_scheduler_config
         # Generic MoE executors allocate their fixed-capacity communication
         # buffers while the Python model is constructed. Preserve the finalized
@@ -435,6 +437,46 @@ class ModelFactory:
 
         # Set model_name to engine_config.runtime_config.model_name (for backward compatibility)
         engine_config.runtime_config.model_name = model_config.model_name
+
+    @staticmethod
+    def _validate_mla_chunked_prefill(
+        engine_config: EngineConfig, model_config: ModelConfig
+    ) -> None:
+        """Validate eager MLA prefill; decode may use the native CUDA Graph path."""
+        if (
+            not model_config.attn_config.use_mla
+            or engine_config.runtime_config.fifo_scheduler_config.prefill_chunk_size
+            <= 0
+        ):
+            return
+
+        from rtp_llm.device.device_type import is_cuda
+
+        attn = model_config.attn_config
+        parallelism = engine_config.parallelism_config
+        requirements = (
+            (is_cuda(), "the CUDA FlashInfer backend"),
+            (not attn.is_sparse, "non-sparse MLA"),
+            (model_config.compute_dtype == torch.bfloat16, "BF16 computation"),
+            (
+                attn.kv_cache_dtype == KvCacheDataType.BASE,
+                "BF16 KV cache (fp8_kv_cache=0)",
+            ),
+            (
+                parallelism.prefill_cp_config.method == CPRotateMethod.DISABLED,
+                "CP disabled",
+            ),
+            (
+                engine_config.sp_config.type == SpeculativeType.NONE,
+                "speculative decoding disabled",
+            ),
+        )
+        for supported, requirement in requirements:
+            if not supported:
+                raise ValueError(
+                    f"MLA chunked prefill currently requires {requirement}; "
+                    "adjust this configuration or set prefill_chunk_size=0."
+                )
 
     @staticmethod
     def create_propose_model_config(
