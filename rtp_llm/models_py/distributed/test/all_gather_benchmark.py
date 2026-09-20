@@ -103,6 +103,9 @@ def main():
     config.tp_size = world_size
     config.dp_size = 1
     base_port = args.rtp_port + 11
+    # torchrun's agent store uses its own rendezvous port. RTP initializes an
+    # independent TCPStore below, so rank 0 must host that store for this run.
+    os.environ["TORCHELASTIC_USE_AGENT_STORE"] = "False"
     init_distributed_environment(
         config,
         nccl_comm_config=NcclCommConfig(
