@@ -180,16 +180,18 @@ private:
 
 }  // namespace
 
-static void setGroupBlockNumsForTest(CacheConfig& config, const std::vector<uint32_t>& block_nums) {
+static void setGroupBlockNumsForTest(CacheConfig&                    config,
+                                     const std::vector<std::string>& tags,
+                                     const std::vector<uint32_t>&    block_nums) {
     std::vector<size_t> kv_strides;
     std::vector<size_t> scale_strides;
     kv_strides.reserve(static_cast<size_t>(config.groupNums()));
     scale_strides.reserve(static_cast<size_t>(config.groupNums()));
-    for (size_t gid = 0; gid < static_cast<size_t>(config.groupNums()); ++gid) {
-        kv_strides.push_back(config.kvBlockStrideBytesForGroup(gid));
-        scale_strides.push_back(config.kvScaleStrideBytesForGroup(gid));
+    for (const auto& tag : tags) {
+        kv_strides.push_back(config.group(tag).kvBlockStrideBytes());
+        scale_strides.push_back(config.group(tag).kvScaleStrideBytes());
     }
-    config.setGroupBlockLayout(block_nums, kv_strides, scale_strides);
+    config.setGroupBlockLayout(tags, block_nums, kv_strides, scale_strides);
 }
 
 static void initDsv4BatchGroups(BatchKVCacheResource& batch_res, const CacheConfig& config) {
@@ -455,6 +457,26 @@ static GroupBase makeTestGroup(const KVCacheSpecPtr& spec, CacheGroupType type, 
     return group;
 }
 
+TEST(CacheConfigTest, GroupIdentityQueriesPreserveGeometryAcrossTopologyOrders) {
+    auto                         full_spec = test::makeResolvedMhaSpec(DataType::TYPE_FP16, 1, 4, 16, "full");
+    auto                         swa_spec  = test::makeResolvedMhaSpec(DataType::TYPE_FP16, 1, 8, 8, "swa");
+    auto                         full      = makeTestGroup(full_spec, CacheGroupType::FULL, {1, 2});
+    auto                         swa       = makeTestGroup(swa_spec, CacheGroupType::SWA, {0, 1});
+    const std::vector<LayerBase> layers{{0, {"swa"}}, {1, {"full", "swa"}}, {2, {"full"}}};
+
+    for (const auto& groups : {std::vector<GroupBase>{full, swa}, std::vector<GroupBase>{swa, full}}) {
+        CacheConfig config;
+        config.layer_num = 3;
+        config.setTopology(groups, layers);
+        EXPECT_EQ(config.layerIdsForGroup("full"), (std::vector<int>{1, 2}));
+        EXPECT_EQ(config.layerIdsForGroup("swa"), (std::vector<int>{0, 1}));
+        EXPECT_EQ(config.blockSizeBytesForGroup("full"), 2u * (full.kvBlockStrideBytes() + full.kvScaleStrideBytes()));
+        EXPECT_EQ(config.blockSizeBytesForGroup("swa"), 2u * (swa.kvBlockStrideBytes() + swa.kvScaleStrideBytes()));
+        EXPECT_ANY_THROW(config.layerIdsForGroup("missing"));
+        EXPECT_ANY_THROW(config.blockSizeBytesForGroup("missing"));
+    }
+}
+
 TEST(CacheConfigTest, SetTopologyInstallsTagAndGroupTopology) {
     CacheConfig config;
     config.layer_num = 3;
@@ -501,7 +523,12 @@ TEST(CacheConfigTest, TopologyRemainsTheSingleSourceAcrossSupportedUpdates) {
     EXPECT_EQ(config.group("full").policy.enable_prefix_reuse, policies[0].enable_prefix_reuse);
     EXPECT_NE(initial_topology->group("full").policy.enable_prefix_reuse, policies[0].enable_prefix_reuse);
 
-    test::setGroupBlockLayout(config, {17, 9}, {128, 256}, {4, 8});
+    // The fixture receives rows independently ordered from the target topology.
+    EXPECT_ANY_THROW(test::setGroupBlockLayout(config, {"linear", "missing"}, {9, 17}, {256, 128}, {8, 4}));
+    EXPECT_EQ(config.topologyPtr(), policy_topology);
+    EXPECT_ANY_THROW(test::setGroupBlockLayout(config, {"linear", "linear"}, {9, 17}, {256, 128}, {8, 4}));
+    EXPECT_EQ(config.topologyPtr(), policy_topology);
+    test::setGroupBlockLayout(config, {"linear", "full"}, {9, 17}, {256, 128}, {8, 4});
     const auto layout_topology = config.topologyPtr();
 
     EXPECT_NE(layout_topology.get(), policy_topology.get());
@@ -2533,7 +2560,8 @@ static CacheConfig makeDSV4CpAllocatorConfig(uint32_t cp_size) {
     pc.prefill_cp_config.kv_cache_sharded = true;
     auto config                           = CacheConfigCreator::createWarmupConfig(mc, pc, 0);
     config.block_num                      = 200;
-    setGroupBlockNumsForTest(config, std::vector<uint32_t>(static_cast<size_t>(config.groupNums()), config.block_num));
+    setGroupBlockNumsForTest(
+        config, config.groupTags(), std::vector<uint32_t>(static_cast<size_t>(config.groupNums()), config.block_num));
     return config;
 }
 
@@ -3278,7 +3306,7 @@ TEST_F(DSV4AllocatorTest, HybridPoolReserveBlocksDoNotReduceExplicitHcaStateCapa
             block_nums[gid] = 11;
         }
     }
-    setGroupBlockNumsForTest(config, block_nums);
+    setGroupBlockNumsForTest(config, config.groupTags(), block_nums);
 
     auto allocator = std::make_shared<TestDSV4HybridPoolAllocator>(
         config, AllocationType::DEVICE, nullptr, /*reserve_block_ratio=*/50);
@@ -3325,7 +3353,7 @@ TEST_F(DSV4AllocatorTest, HybridPoolReserveBlocksDoNotReduceExplicitFixedPoolCap
             block_nums[gid] = 11;
         }
     }
-    setGroupBlockNumsForTest(config, block_nums);
+    setGroupBlockNumsForTest(config, config.groupTags(), block_nums);
 
     auto allocator =
         std::make_shared<KVCacheAllocator>(config, AllocationType::DEVICE, nullptr, /*reserve_block_ratio=*/50);
