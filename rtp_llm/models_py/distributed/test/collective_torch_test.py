@@ -15,6 +15,7 @@ logging.basicConfig(level=logging.INFO)
 
 import torch
 
+from rtp_llm.models_py.distributed import collective_torch
 from rtp_llm.models_py.distributed.collective_torch import (
     Group,
     _get_group,
@@ -29,7 +30,6 @@ from rtp_llm.models_py.distributed.collective_torch import (
     reduce_scatter_padded,
     send,
 )
-from rtp_llm.models_py.distributed import collective_torch
 from rtp_llm.ops import NcclCommConfig, ParallelismConfig
 from rtp_llm.test.utils.port_util import PortManager
 
@@ -382,6 +382,59 @@ def _test_padded_rs_ag_worker(
         destroy_distributed_environment()
 
 
+def _test_all_gather_full_buffer_worker(
+    rank: int, world_size: int, tp_size: int, dp_size: int, nccl_port: int
+):
+    """Check that the NCCL fallback fills the entire uninitialized BF16 output."""
+    config = ParallelismConfig()
+    base_port = nccl_port + 11
+    config.world_rank = rank
+    config.world_size = world_size
+    config.local_rank = rank
+    config.tp_size = tp_size
+    config.dp_size = dp_size
+    torch.cuda.set_device(rank)
+    init_distributed_environment(
+        config,
+        nccl_comm_config=NcclCommConfig(
+            nccl_ip="127.0.0.1",
+            tp_nccl_port=base_port - 2,
+            dp_tp_nccl_port=base_port - 10,
+            ffn_tp_nccl_port=base_port - 5,
+        ),
+        nccl_init_port=base_port - 11,
+        backend="nccl",
+        timeout=60,
+    )
+    try:
+        for rows in (1, 257, 1024):
+            values = torch.arange(rows, device=f"cuda:{rank}") % 97
+            local = (
+                (values[:, None] + rank * 100)
+                .to(torch.bfloat16)
+                .expand(rows, 896)
+                .contiguous()
+            )
+            # DP_AND_TP uses the same all_gather_into_tensor fallback as TP,
+            # without an optional symmetric-memory TP implementation.
+            result = all_gather(local, group=Group.DP_AND_TP)
+            assert result.shape == (world_size * rows, 896)
+            assert result.dtype == torch.bfloat16
+            for source_rank, chunk in enumerate(result.split(rows)):
+                expected = (
+                    (values[:, None] + source_rank * 100)
+                    .to(torch.bfloat16)
+                    .expand(rows, 896)
+                )
+                assert torch.equal(chunk, expected), (
+                    f"rank {rank}, source {source_rank}, rows {rows}: "
+                    "all_gather output differs"
+                )
+        torch.distributed.barrier()
+    finally:
+        destroy_distributed_environment()
+
+
 class TestCollectiveOperations(unittest.TestCase):
     """Test collective operations with real multiprocessing"""
 
@@ -474,6 +527,15 @@ class TestCollectiveOperations(unittest.TestCase):
             test_name="padded_reduce_scatter_all_gather_tp8",
         )
 
+    def test_all_gather_full_buffer_tp8(self):
+        self._run_test(
+            _test_all_gather_full_buffer_worker,
+            world_size=8,
+            tp_size=8,
+            dp_size=1,
+            test_name="all_gather_full_buffer_tp8",
+        )
+
 
 class TestDistributedEnvironment(unittest.TestCase):
     """Test distributed environment initialization"""
@@ -484,6 +546,37 @@ class TestDistributedEnvironment(unittest.TestCase):
     def test_distributed_environment_initialized(self):
         """Test checking if distributed environment is initialized"""
         self.assertFalse(distributed_environment_initialized())
+
+    def test_all_gather_allocates_without_zero_fill(self):
+        local = torch.arange(6, dtype=torch.bfloat16).reshape(2, 3)
+        process_group = object()
+
+        def fake_collective(output, input_tensor, group):
+            self.assertIs(group, process_group)
+            for source_rank in range(3):
+                output.narrow(0, source_rank * 2, 2).copy_(
+                    input_tensor + source_rank * 10
+                )
+
+        with patch.object(
+            collective_torch, "_get_rocm_rccl", return_value=None
+        ), patch.object(
+            collective_torch, "_get_group", return_value=process_group
+        ), patch.object(
+            torch.distributed, "get_world_size", return_value=3
+        ), patch.object(
+            torch.distributed, "all_gather_into_tensor", side_effect=fake_collective
+        ) as gather, patch.object(
+            torch, "empty", wraps=torch.empty
+        ) as empty, patch.object(
+            torch, "zeros", side_effect=AssertionError("zero fill is unnecessary")
+        ):
+            result = all_gather(local, group=Group.DP_AND_TP)
+
+        empty.assert_called_once_with([6, 3], device=local.device, dtype=local.dtype)
+        gather.assert_called_once()
+        expected = torch.cat([local + source_rank * 10 for source_rank in range(3)])
+        self.assertTrue(torch.equal(result, expected))
 
     def test_projection_ktp_reuses_one_full_world_communicator_for_ep(self):
         config = SimpleNamespace(
