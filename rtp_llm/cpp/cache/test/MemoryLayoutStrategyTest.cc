@@ -150,7 +150,7 @@ protected:
         cache_config.seq_size_per_block = 1;
         initializeSingleGroup(cache_config, spec);
 
-        auto pool_cfg   = DeviceBlockPoolConfigHelper::createConfig(cache_config);
+        auto pool_cfg   = DeviceBlockPoolConfigHelper::createConfigForGroup(cache_config, cache_config.topology().groups().front());
         auto layout_cfg = pool_cfg.memory_layouts[0];
 
         layout_cfg.enable_kv_scale          = false;
@@ -167,6 +167,7 @@ protected:
         std::vector<int> layer_ids(cache_config.layer_num);
         std::iota(layer_ids.begin(), layer_ids.end(), 0);
         cache_config.fromGroupedSpecs({spec}, {layer_ids}, {CacheGroupType::FULL}, {"default"});
+        cache_config.finalizeBlockNums(cache_config.block_num, rtp_llm::RuntimeConfig{});
     }
 
     static MemoryLayoutConfig createTestConfig(size_t k_block_bytes = 512, size_t v_block_bytes = 512) {
@@ -246,7 +247,7 @@ TEST_F(MemoryLayoutStrategyTest, InitializationWithScaleTensor) {
     cache_config.seq_size_per_block = 4;
     initializeSingleGroup(cache_config, spec);
 
-    auto pool_cfg = DeviceBlockPoolConfigHelper::createConfig(cache_config);
+    auto pool_cfg = DeviceBlockPoolConfigHelper::createConfigForGroup(cache_config, cache_config.topology().groups().front());
     auto config   = pool_cfg.memory_layouts[0];  // keep enable_kv_scale=true
 
     auto  kv_cache_tensor = torch::zeros({static_cast<int64_t>(config.kv_block_pool_size_bytes)}, torch::kInt8);
@@ -408,7 +409,7 @@ TEST_F(MemoryLayoutStrategyTest, ConvertIndexToBufferPartitionedByHeadFp16UsesBy
     cache_config.seq_size_per_block = 64;
     initializeSingleGroup(cache_config, spec);
 
-    auto pool_cfg = DeviceBlockPoolConfigHelper::createConfig(cache_config);
+    auto pool_cfg = DeviceBlockPoolConfigHelper::createConfigForGroup(cache_config, cache_config.topology().groups().front());
     auto config   = pool_cfg.memory_layouts[0];
 
     auto options = torch::TensorOptions().dtype(torch::kInt8).device(torch::kCPU);
@@ -480,7 +481,7 @@ TEST_F(MemoryLayoutStrategyTest, ConvertIndexToBufferPartitionedByHeadWithScale)
     cache_config.seq_size_per_block = 64;
     initializeSingleGroup(cache_config, spec);
 
-    auto pool_cfg = DeviceBlockPoolConfigHelper::createConfig(cache_config);
+    auto pool_cfg = DeviceBlockPoolConfigHelper::createConfigForGroup(cache_config, cache_config.topology().groups().front());
     auto config   = pool_cfg.memory_layouts[0];  // keep enable_kv_scale=true
 
     auto options = torch::TensorOptions().dtype(torch::kInt8).device(torch::kCPU);
@@ -646,7 +647,7 @@ TEST_F(MemoryLayoutStrategyTest, DeviceBlockPoolConfigPropagatesKernelBlockSplit
     cache_config.seq_size_per_block = 4;
     initializeSingleGroup(cache_config, spec);
 
-    auto pool_config = DeviceBlockPoolConfigHelper::createConfig(cache_config);
+    auto pool_config = DeviceBlockPoolConfigHelper::createConfigForGroup(cache_config, cache_config.topology().groups().front());
     ASSERT_EQ(pool_config.memory_layouts.size(), 1u);
     auto layout_config = pool_config.memory_layouts[0];
     EXPECT_EQ(layout_config.kernel_blocks_per_kv_block, 2u);
