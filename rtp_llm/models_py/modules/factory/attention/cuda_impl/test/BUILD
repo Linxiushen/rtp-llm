@@ -45,7 +45,7 @@ flashinfer_test_deps = py_test_deps + select({
 flashinfer_platforms = [
     {"sm": "sm90", "gpu": "H20"},
     {"sm": "sm8x", "gpu": "L20"},
-    {"sm": "sm12x", "gpu": "RTX_5000_PRO"},
+    {"sm": "sm12x", "gpu": "RTX_5000_PRO_CU13"},
 ]
 
 flashinfer_attention_tests = [
@@ -163,9 +163,9 @@ py_test(
         "@//:using_cuda12_9_x86": flashinfer_deps,
         "//conditions:default": []
     }),
-    tags = ["RTX_5000_PRO"],
+    tags = ["RTX_5000_PRO_CU13"],
     exec_properties = {
-        'gpu': 'RTX_5000_PRO',
+        'gpu': 'RTX_5000_PRO_CU13',
     },
 )
 
@@ -207,9 +207,9 @@ py_test(
         "@//:using_cuda12_9_x86": flashinfer_deps,
         "//conditions:default": []
     }),
-    tags = ["RTX_5000_PRO"],
+    tags = ["RTX_5000_PRO_CU13"],
     exec_properties = {
-        'gpu': 'RTX_5000_PRO',
+        'gpu': 'RTX_5000_PRO_CU13',
     },
 )
 
