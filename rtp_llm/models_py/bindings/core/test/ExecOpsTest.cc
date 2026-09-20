@@ -509,17 +509,19 @@ TEST_F(ExecOpsTest, testWriteCacheStoreCallbackFailureReachesPublicationWait) {
     CacheStoreAsyncWriter writer;
     writer.init(/*track_store_completions=*/true);
 
-    EXPECT_NO_THROW(runtimeWriteCacheStore(inputs,
-                                           layer_cache,
-                                           config,
-                                           cache_store,
-                                           /*cache_model_id=*/0,
-                                           /*cp_rank=*/0,
-                                           /*cp_size=*/1,
-                                           nullptr,
-                                           [&writer](const std::vector<int64_t>&, const std::vector<int32_t>&, size_t) {
-                                               return writer.registerStoreCompletion();
-                                           }));
+    EXPECT_NO_THROW(runtimeWriteCacheStore(
+        inputs,
+        layer_cache,
+        config,
+        cache_store,
+        /*cache_model_id=*/0,
+        /*cp_rank=*/0,
+        /*cp_size=*/1,
+        nullptr,
+        [&writer](const std::vector<int64_t>&, const std::vector<int32_t>&, const std::string& tag) {
+            EXPECT_EQ(tag, "default");
+            return writer.registerStoreCompletion();
+        }));
     writer.finishSubmissions();
     EXPECT_THROW(writer.waitStoreCompletions(), std::runtime_error);
 }
@@ -545,17 +547,19 @@ TEST_F(ExecOpsTest, testWriteCacheStoreSynchronousThrowCompletesTokenExactlyOnce
     CacheStoreAsyncWriter writer;
     writer.init(/*track_store_completions=*/true);
 
-    EXPECT_THROW(runtimeWriteCacheStore(inputs,
-                                        layer_cache,
-                                        config,
-                                        cache_store,
-                                        /*cache_model_id=*/0,
-                                        /*cp_rank=*/0,
-                                        /*cp_size=*/1,
-                                        nullptr,
-                                        [&writer](const std::vector<int64_t>&, const std::vector<int32_t>&, size_t) {
-                                            return writer.registerStoreCompletion();
-                                        }),
+    EXPECT_THROW(runtimeWriteCacheStore(
+                     inputs,
+                     layer_cache,
+                     config,
+                     cache_store,
+                     /*cache_model_id=*/0,
+                     /*cp_rank=*/0,
+                     /*cp_size=*/1,
+                     nullptr,
+                     [&writer](const std::vector<int64_t>&, const std::vector<int32_t>&, const std::string& tag) {
+                         EXPECT_EQ(tag, "default");
+                         return writer.registerStoreCompletion();
+                     }),
                  std::runtime_error);
     writer.finishSubmissions();
     EXPECT_THROW(writer.waitStoreCompletions(), std::runtime_error);
@@ -583,17 +587,19 @@ TEST_F(ExecOpsTest, testWriteCacheStoreDuplicateCallbackDoesNotUnderflow) {
     CacheStoreAsyncWriter writer;
     writer.init(/*track_store_completions=*/true);
 
-    EXPECT_NO_THROW(runtimeWriteCacheStore(inputs,
-                                           layer_cache,
-                                           config,
-                                           cache_store,
-                                           /*cache_model_id=*/0,
-                                           /*cp_rank=*/0,
-                                           /*cp_size=*/1,
-                                           nullptr,
-                                           [&writer](const std::vector<int64_t>&, const std::vector<int32_t>&, size_t) {
-                                               return writer.registerStoreCompletion();
-                                           }));
+    EXPECT_NO_THROW(runtimeWriteCacheStore(
+        inputs,
+        layer_cache,
+        config,
+        cache_store,
+        /*cache_model_id=*/0,
+        /*cp_rank=*/0,
+        /*cp_size=*/1,
+        nullptr,
+        [&writer](const std::vector<int64_t>&, const std::vector<int32_t>&, const std::string& tag) {
+            EXPECT_EQ(tag, "default");
+            return writer.registerStoreCompletion();
+        }));
     writer.finishSubmissions();
     EXPECT_NO_THROW(writer.waitStoreCompletions());
 }
@@ -619,17 +625,19 @@ TEST_F(ExecOpsTest, testWriteCacheStoreZeroSelectedBlocksRegistersNoCompletion) 
     CacheStoreAsyncWriter writer;
     writer.init(/*track_store_completions=*/true);
 
-    EXPECT_NO_THROW(runtimeWriteCacheStore(inputs,
-                                           layer_cache,
-                                           config,
-                                           cache_store,
-                                           /*cache_model_id=*/0,
-                                           /*cp_rank=*/0,
-                                           /*cp_size=*/1,
-                                           nullptr,
-                                           [&writer](const std::vector<int64_t>&, const std::vector<int32_t>&, size_t) {
-                                               return writer.registerStoreCompletion();
-                                           }));
+    EXPECT_NO_THROW(runtimeWriteCacheStore(
+        inputs,
+        layer_cache,
+        config,
+        cache_store,
+        /*cache_model_id=*/0,
+        /*cp_rank=*/0,
+        /*cp_size=*/1,
+        nullptr,
+        [&writer](const std::vector<int64_t>&, const std::vector<int32_t>&, const std::string& tag) {
+            EXPECT_EQ(tag, "default");
+            return writer.registerStoreCompletion();
+        }));
     writer.finishSubmissions();
     EXPECT_NO_THROW(writer.waitStoreCompletions());
     EXPECT_TRUE(cache_store->records.empty());
@@ -656,18 +664,19 @@ TEST_F(ExecOpsTest, testWriteCacheStoreTrackedPublicationWithoutCacheStoreThrows
 
     // Skipping here would leave zero pending callbacks, so the caller's wait
     // would falsely report a successful publication.
-    EXPECT_ANY_THROW(
-        runtimeWriteCacheStore(inputs,
-                               layer_cache,
-                               config,
-                               /*cache_store=*/nullptr,
-                               /*cache_model_id=*/0,
-                               /*cp_rank=*/0,
-                               /*cp_size=*/1,
-                               nullptr,
-                               [&writer](const std::vector<int64_t>&, const std::vector<int32_t>&, size_t) {
-                                   return writer.registerStoreCompletion();
-                               }));
+    EXPECT_ANY_THROW(runtimeWriteCacheStore(
+        inputs,
+        layer_cache,
+        config,
+        /*cache_store=*/nullptr,
+        /*cache_model_id=*/0,
+        /*cp_rank=*/0,
+        /*cp_size=*/1,
+        nullptr,
+        [&writer](const std::vector<int64_t>&, const std::vector<int32_t>&, const std::string& tag) {
+            EXPECT_EQ(tag, "default");
+            return writer.registerStoreCompletion();
+        }));
     writer.finishSubmissions();
     EXPECT_NO_THROW(writer.waitStoreCompletions());
 }
@@ -1232,8 +1241,22 @@ TEST_F(ExecOpsTest, testWriteCacheStoreTag_FullGroup) {
     layer_cache.layer_id           = 1;
     layer_cache.tag                = "full";
 
+    size_t registrar_calls = 0;
     ASSERT_NO_THROW(runtimeWriteCacheStore(
-        inputs, layer_cache, config, cache_store, /*cache_model_id=*/0, /*cp_rank=*/0, /*cp_size=*/1, nullptr));
+        inputs,
+        layer_cache,
+        config,
+        cache_store,
+        /*cache_model_id=*/0,
+        /*cp_rank=*/0,
+        /*cp_size=*/1,
+        nullptr,
+        [&registrar_calls](const std::vector<int64_t>&, const std::vector<int32_t>&, const std::string& tag) {
+            ++registrar_calls;
+            EXPECT_EQ(tag, "full");
+            return CacheStoreCompletionCallback{};
+        }));
+    EXPECT_EQ(registrar_calls, 1u);
 
     ASSERT_EQ(cache_store->records.size(), 1u);
     EXPECT_EQ(cache_store->records[0].block_count, 3u)
