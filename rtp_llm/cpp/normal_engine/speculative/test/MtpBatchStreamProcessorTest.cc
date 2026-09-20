@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <memory>
@@ -30,33 +31,60 @@ std::vector<T> toVec(const torch::Tensor& t) {
     return std::vector<T>(c.data_ptr<T>(), c.data_ptr<T>() + c.numel());
 }
 
-void fillScoreTokenIdsWithMemcpy(torch::Tensor&                     token_ids,
-                                 const std::vector<torch::Tensor>&  complete_token_ids,
-                                 const std::vector<int64_t>&        seq_lens,
-                                 int64_t                            score_len) {
+void fillScoreTokenIdsWithFastPath(torch::Tensor&                    token_ids,
+                                   const std::vector<torch::Tensor>& complete_token_ids,
+                                   const std::vector<int64_t>&       seq_lens,
+                                   int64_t                           score_len) {
     int64_t batch_idx = 0;
-    auto*   dst       = token_ids.data_ptr<int32_t>();
-    const auto dst_stride = token_ids.size(1);
     for (size_t stream_idx = 0; stream_idx < complete_token_ids.size(); ++stream_idx) {
-        auto* src     = complete_token_ids[stream_idx].data_ptr<int32_t>();
-        auto  seq_len = seq_lens[stream_idx];
-        for (int64_t i = 0; i < score_len; ++i) {
-            std::memcpy(dst + batch_idx * dst_stride, src, seq_len * sizeof(int32_t));
-            ++batch_idx;
-        }
+        copyScoreSamplerTokenIds(token_ids, complete_token_ids[stream_idx], batch_idx, score_len, seq_lens[stream_idx]);
+        batch_idx += score_len;
     }
 }
 
-void fillScoreTokenIdsWithTorchCopy(torch::Tensor&                     token_ids,
-                                    const std::vector<torch::Tensor>&  complete_token_ids,
-                                    const std::vector<int64_t>&        seq_lens,
-                                    int64_t                            score_len) {
+void fillScoreTokenIdsWithTorchCopy(torch::Tensor&                    token_ids,
+                                    const std::vector<torch::Tensor>& complete_token_ids,
+                                    const std::vector<int64_t>&       seq_lens,
+                                    int64_t                           score_len) {
     int64_t batch_idx = 0;
     for (size_t stream_idx = 0; stream_idx < complete_token_ids.size(); ++stream_idx) {
         auto seq_len = seq_lens[stream_idx];
         token_ids.narrow(0, batch_idx, score_len)
             .narrow(1, 0, seq_len)
             .copy_(complete_token_ids[stream_idx].narrow(1, 0, seq_len).expand({score_len, seq_len}));
+        batch_idx += score_len;
+    }
+}
+
+void fillScoreTokenIdsWithDirectViews(torch::Tensor&                    token_ids,
+                                      const std::vector<torch::Tensor>& complete_token_ids,
+                                      const std::vector<int64_t>&       seq_lens,
+                                      int64_t                           score_len) {
+    int64_t batch_idx = 0;
+    for (size_t stream_idx = 0; stream_idx < complete_token_ids.size(); ++stream_idx) {
+        auto seq_len = seq_lens[stream_idx];
+        auto dst     = token_ids.as_strided({score_len, seq_len},
+                                            {token_ids.stride(0), 1},
+                                            token_ids.storage_offset() + batch_idx * token_ids.stride(0));
+        auto src     = complete_token_ids[stream_idx].as_strided(
+            {score_len, seq_len}, {0, 1}, complete_token_ids[stream_idx].storage_offset());
+        dst.copy_(src);
+        batch_idx += score_len;
+    }
+}
+
+void fillScoreTokenIdsWithMemcpy(torch::Tensor&                    token_ids,
+                                 const std::vector<torch::Tensor>& complete_token_ids,
+                                 const std::vector<int64_t>&       seq_lens,
+                                 int64_t                           score_len) {
+    int64_t batch_idx = 0;
+    for (size_t stream_idx = 0; stream_idx < complete_token_ids.size(); ++stream_idx) {
+        auto* dst = token_ids.data_ptr<int32_t>() + batch_idx * token_ids.stride(0);
+        auto* src = complete_token_ids[stream_idx].data_ptr<int32_t>();
+        for (int64_t row = 0; row < score_len; ++row) {
+            std::memcpy(dst, src, static_cast<size_t>(seq_lens[stream_idx]) * sizeof(int32_t));
+            dst += token_ids.stride(0);
+        }
         batch_idx += score_len;
     }
 }
@@ -128,44 +156,159 @@ public:
     }
 };
 
-TEST_F(MtpBatchStreamProcessorTest, DISABLED_benchmarkScoreTokenIdsTorchCopyVsMemcpy) {
-    constexpr int64_t stream_count = 64;
-    constexpr int64_t score_len    = 4;
-    constexpr int64_t max_seq_len  = 65536;
-    constexpr int     iterations   = 20;
+TEST(MtpScoreTokenIdsCopyTest, copiesOnlySelectedRowsAndPrefix) {
+    auto source_storage = torch::tensor({{99, 1, 2, 3, 4, 5}}, torch::kInt32);
+    auto source         = source_storage.narrow(1, 1, 5);
+    auto target         = torch::full({6, 8}, -1, torch::TensorOptions().dtype(torch::kInt32).pinned_memory(true));
 
-    auto src_storage = torch::empty({stream_count, max_seq_len}, torch::kInt32);
-    src_storage.random_(0, 32000);
-
-    std::vector<torch::Tensor> complete_token_ids;
-    std::vector<int64_t>       seq_lens;
-    complete_token_ids.reserve(stream_count);
-    seq_lens.reserve(stream_count);
-    for (int64_t i = 0; i < stream_count; ++i) {
-        complete_token_ids.push_back(src_storage.narrow(0, i, 1));
-        seq_lens.push_back(max_seq_len - (i % 8) * 128);
+    copyScoreSamplerTokenIds(target, source, /*batch_idx=*/1, /*score_len=*/3, /*seq_len=*/4);
+    const auto* values = target.data_ptr<int32_t>();
+    for (int64_t row = 0; row < 6; ++row) {
+        for (int64_t col = 0; col < 8; ++col) {
+            const int32_t expected = row >= 1 && row < 4 && col < 4 ? static_cast<int32_t>(col + 1) : -1;
+            EXPECT_EQ(values[row * target.stride(0) + col], expected) << "row=" << row << " col=" << col;
+        }
     }
 
-    auto pinned_i32 = torch::TensorOptions(torch::kInt32).pinned_memory(true);
-    auto dst_memcpy = torch::empty({stream_count * score_len, max_seq_len + score_len}, pinned_i32);
-    auto dst_torch  = torch::empty({stream_count * score_len, max_seq_len + score_len}, pinned_i32);
+    auto unchanged = target.clone();
+    copyScoreSamplerTokenIds(target, source, /*batch_idx=*/0, /*score_len=*/0, /*seq_len=*/4);
+    copyScoreSamplerTokenIds(target, source, /*batch_idx=*/0, /*score_len=*/2, /*seq_len=*/0);
+    EXPECT_TRUE(torch::equal(target, unchanged));
+}
 
-    dst_memcpy.fill_(-1);
-    dst_torch.fill_(-1);
-    fillScoreTokenIdsWithMemcpy(dst_memcpy, complete_token_ids, seq_lens, score_len);
-    fillScoreTokenIdsWithTorchCopy(dst_torch, complete_token_ids, seq_lens, score_len);
-    ASSERT_TRUE(torch::equal(dst_memcpy, dst_torch));
+TEST(MtpScoreTokenIdsCopyTest, copiesLargeRowsWithDirectViews) {
+    auto source_storage = torch::arange(9000, torch::TensorOptions().dtype(torch::kInt32)).reshape({1, 9000});
+    auto source         = source_storage.narrow(1, 1, 8999);
+    auto pinned_i32     = torch::TensorOptions(torch::kInt32).pinned_memory(true);
+    auto target         = torch::full({5, 9002}, -1, pinned_i32);
+    auto expected       = target.clone();
 
-    auto memcpy_us =
-        benchmarkUs([&]() { fillScoreTokenIdsWithMemcpy(dst_memcpy, complete_token_ids, seq_lens, score_len); },
-                    iterations);
-    auto torch_us =
-        benchmarkUs([&]() { fillScoreTokenIdsWithTorchCopy(dst_torch, complete_token_ids, seq_lens, score_len); },
-                    iterations);
+    expected.narrow(0, 1, 3).narrow(1, 0, 8999).copy_(source.expand({3, 8999}));
+    copyScoreSamplerTokenIds(target, source, /*batch_idx=*/1, /*score_len=*/3, /*seq_len=*/8999);
+    EXPECT_TRUE(torch::equal(target, expected));
+}
 
-    std::cout << "[mtp-score-token-ids-copy] streams=" << stream_count << " score_len=" << score_len
-              << " max_seq_len=" << max_seq_len << " iterations=" << iterations << " memcpy_us=" << memcpy_us
-              << " torch_copy_us=" << torch_us << " speedup=" << (memcpy_us / torch_us) << std::endl;
+TEST(MtpScoreTokenIdsCopyTest, copiesAliasingRowsWithTorchFallback) {
+    auto target   = torch::tensor({{1, 2, 3, 4}, {-1, -1, -1, -1}, {-1, -1, -1, -1}}, torch::kInt32);
+    auto source   = target.narrow(0, 0, 1);
+    auto expected = target.clone();
+    expected.narrow(0, 1, 2).copy_(source.expand({2, 4}));
+
+    copyScoreSamplerTokenIds(target, source, /*batch_idx=*/1, /*score_len=*/2, /*seq_len=*/4);
+    EXPECT_TRUE(torch::equal(target, expected));
+}
+
+TEST(MtpScoreTokenIdsCopyTest, preservesTorchFallbackForStridedTensors) {
+    auto source_storage = torch::tensor({{10, 99, 20, 99, 30, 99, 40, 99}}, torch::kInt32);
+    auto source         = source_storage.slice(/*dim=*/1, /*start=*/0, /*end=*/8, /*step=*/2);
+    auto target_storage = torch::full({8, 5}, -1, torch::kInt32);
+    auto target         = target_storage.transpose(0, 1);
+    ASSERT_NE(source.stride(1), 1);
+    ASSERT_NE(target.stride(1), 1);
+
+    copyScoreSamplerTokenIds(target, source, /*batch_idx=*/1, /*score_len=*/2, /*seq_len=*/3);
+    for (int64_t row = 0; row < 5; ++row) {
+        for (int64_t col = 0; col < 8; ++col) {
+            const int32_t expected = row >= 1 && row < 3 && col < 3 ? static_cast<int32_t>((col + 1) * 10) : -1;
+            EXPECT_EQ(target[row][col].item<int32_t>(), expected) << "row=" << row << " col=" << col;
+        }
+    }
+}
+
+TEST(MtpScoreTokenIdsCopyTest, DISABLED_benchmarkScoreTokenIdsFastPathVsTorchCopy) {
+    constexpr int64_t          stream_count   = 21;
+    constexpr int64_t          score_len      = 4;
+    constexpr int              iterations     = 50;
+    const std::vector<int64_t> mixed_seq_lens = {98304, 20480,  32768,  65536, 40960,  122880, 53248,
+                                                 67584, 120832, 94208,  1024,  106496, 51200,  98304,
+                                                 22528, 55296,  221184, 512,   2048,   122880, 57344};
+    struct BenchmarkCase {
+        int64_t max_seq_len;
+        bool    mixed_lengths;
+    };
+
+    for (const auto benchmark_case : {BenchmarkCase{512, false},
+                                      BenchmarkCase{4096, false},
+                                      BenchmarkCase{65536, false},
+                                      BenchmarkCase{219674, false},
+                                      BenchmarkCase{221184, true}}) {
+        const int64_t max_seq_len = benchmark_case.max_seq_len;
+        auto          src_storage = torch::empty({stream_count, max_seq_len}, torch::kInt32);
+        src_storage.random_(0, 32000);
+
+        std::vector<torch::Tensor> complete_token_ids;
+        std::vector<int64_t>       seq_lens;
+        complete_token_ids.reserve(stream_count);
+        seq_lens.reserve(stream_count);
+        for (int64_t i = 0; i < stream_count; ++i) {
+            complete_token_ids.push_back(src_storage.narrow(0, i, 1));
+            seq_lens.push_back(benchmark_case.mixed_lengths ?
+                                   mixed_seq_lens[i] :
+                                   max_seq_len - (i % 8) * std::min<int64_t>(128, max_seq_len / 8));
+        }
+
+        auto pinned_i32 = torch::TensorOptions(torch::kInt32).pinned_memory(true);
+        auto dst_fast   = torch::empty({stream_count * score_len, max_seq_len + score_len}, pinned_i32);
+        auto dst_torch  = torch::empty({stream_count * score_len, max_seq_len + score_len}, pinned_i32);
+        auto dst_direct = torch::empty({stream_count * score_len, max_seq_len + score_len}, pinned_i32);
+        auto dst_memcpy = torch::empty({stream_count * score_len, max_seq_len + score_len}, pinned_i32);
+
+        dst_fast.fill_(-1);
+        dst_torch.fill_(-1);
+        dst_direct.fill_(-1);
+        dst_memcpy.fill_(-1);
+        fillScoreTokenIdsWithFastPath(dst_fast, complete_token_ids, seq_lens, score_len);
+        fillScoreTokenIdsWithTorchCopy(dst_torch, complete_token_ids, seq_lens, score_len);
+        fillScoreTokenIdsWithDirectViews(dst_direct, complete_token_ids, seq_lens, score_len);
+        fillScoreTokenIdsWithMemcpy(dst_memcpy, complete_token_ids, seq_lens, score_len);
+        ASSERT_TRUE(torch::equal(dst_fast, dst_torch));
+        ASSERT_TRUE(torch::equal(dst_direct, dst_torch));
+        ASSERT_TRUE(torch::equal(dst_memcpy, dst_torch));
+
+        std::vector<double> fast_us;
+        std::vector<double> torch_us;
+        std::vector<double> direct_us;
+        std::vector<double> memcpy_us;
+        for (int trial = 0; trial < 5; ++trial) {
+            if (trial % 2 == 0) {
+                fast_us.push_back(benchmarkUs(
+                    [&]() { fillScoreTokenIdsWithFastPath(dst_fast, complete_token_ids, seq_lens, score_len); },
+                    iterations));
+                torch_us.push_back(benchmarkUs(
+                    [&]() { fillScoreTokenIdsWithTorchCopy(dst_torch, complete_token_ids, seq_lens, score_len); },
+                    iterations));
+                direct_us.push_back(benchmarkUs(
+                    [&]() { fillScoreTokenIdsWithDirectViews(dst_direct, complete_token_ids, seq_lens, score_len); },
+                    iterations));
+                memcpy_us.push_back(benchmarkUs(
+                    [&]() { fillScoreTokenIdsWithMemcpy(dst_memcpy, complete_token_ids, seq_lens, score_len); },
+                    iterations));
+            } else {
+                memcpy_us.push_back(benchmarkUs(
+                    [&]() { fillScoreTokenIdsWithMemcpy(dst_memcpy, complete_token_ids, seq_lens, score_len); },
+                    iterations));
+                direct_us.push_back(benchmarkUs(
+                    [&]() { fillScoreTokenIdsWithDirectViews(dst_direct, complete_token_ids, seq_lens, score_len); },
+                    iterations));
+                torch_us.push_back(benchmarkUs(
+                    [&]() { fillScoreTokenIdsWithTorchCopy(dst_torch, complete_token_ids, seq_lens, score_len); },
+                    iterations));
+                fast_us.push_back(benchmarkUs(
+                    [&]() { fillScoreTokenIdsWithFastPath(dst_fast, complete_token_ids, seq_lens, score_len); },
+                    iterations));
+            }
+        }
+        std::sort(fast_us.begin(), fast_us.end());
+        std::sort(torch_us.begin(), torch_us.end());
+        std::sort(direct_us.begin(), direct_us.end());
+        std::sort(memcpy_us.begin(), memcpy_us.end());
+
+        std::cout << "[mtp-score-token-ids-copy] streams=" << stream_count << " score_len=" << score_len
+                  << " max_seq_len=" << max_seq_len << " mixed_lengths=" << benchmark_case.mixed_lengths
+                  << " iterations=" << iterations << " fast_us=" << fast_us[2] << " torch_copy_us=" << torch_us[2]
+                  << " direct_views_us=" << direct_us[2] << " memcpy_us=" << memcpy_us[2]
+                  << " speedup=" << (torch_us[2] / fast_us[2]) << std::endl;
+    }
 }
 
 TEST_F(MtpBatchStreamProcessorTest, testGatherSpecSamplerInputReplicatesScoreTokenIds) {

@@ -325,19 +325,6 @@ torch::Tensor interleaveTokenPairs(const torch::Tensor& first, const torch::Tens
     return torch::stack({first, second}, /*dim=*/1).reshape({-1});
 }
 
-void copyScoreSamplerTokenIds(torch::Tensor&       token_ids,
-                              const torch::Tensor& complete_token_ids,
-                              int64_t              batch_idx,
-                              int64_t              score_len,
-                              int64_t              seq_len) {
-    if (score_len <= 0 || seq_len <= 0) {
-        return;
-    }
-    auto dst = token_ids.narrow(0, batch_idx, score_len).narrow(1, 0, seq_len);
-    auto src = complete_token_ids.narrow(0, 0, 1).narrow(1, 0, seq_len).expand({score_len, seq_len});
-    dst.copy_(src);
-}
-
 const char* missingMtpStateReason(const GenerateStreamPtr& stream) {
     if (!stream->getAcceptTokensGpu().defined()) {
         return "accept_tokens_gpu_missing";
@@ -422,7 +409,63 @@ bool legacyGpuProposePathEnabled(size_t batch_size) {
            || static_cast<int64_t>(batch_size) >= kMinBatchForLegacyGpuProposeTokens;
 }
 
+bool isCpuInt32Matrix(const torch::Tensor& tensor) {
+    return tensor.defined() && tensor.dim() == 2 && tensor.device().is_cpu() && tensor.scalar_type() == torch::kInt32
+           && tensor.is_contiguous();
+}
+
+bool canCopyScoreTokenIdsFast(const torch::Tensor& token_ids,
+                              const torch::Tensor& complete_token_ids,
+                              int64_t              batch_idx,
+                              int64_t              score_len,
+                              int64_t              seq_len) {
+    if (!isCpuInt32Matrix(token_ids) || !isCpuInt32Matrix(complete_token_ids)
+        || token_ids.is_alias_of(complete_token_ids)) {
+        return false;
+    }
+    return batch_idx >= 0 && complete_token_ids.size(0) > 0 && score_len <= token_ids.size(0)
+           && batch_idx <= token_ids.size(0) - score_len && seq_len <= token_ids.size(1)
+           && seq_len <= complete_token_ids.size(1);
+}
+
 }  // namespace
+
+void copyScoreSamplerTokenIds(torch::Tensor&       token_ids,
+                              const torch::Tensor& complete_token_ids,
+                              int64_t              batch_idx,
+                              int64_t              score_len,
+                              int64_t              seq_len) {
+    if (score_len <= 0 || seq_len <= 0) {
+        return;
+    }
+
+    // The normal MTP path copies CPU token history into a pinned CPU staging
+    // tensor. The general path retains Torch's layout and bounds semantics.
+    if (canCopyScoreTokenIdsFast(token_ids, complete_token_ids, batch_idx, score_len, seq_len)) {
+        if (seq_len > 8192) {
+            // TensorIterator parallelizes large copies into pinned memory.
+            auto dst = token_ids.as_strided({score_len, seq_len},
+                                            {token_ids.stride(0), 1},
+                                            token_ids.storage_offset() + batch_idx * token_ids.stride(0));
+            auto src = complete_token_ids.as_strided({score_len, seq_len}, {0, 1}, complete_token_ids.storage_offset());
+            dst.copy_(src);
+            return;
+        }
+
+        auto*       dst    = token_ids.data_ptr<int32_t>() + batch_idx * token_ids.stride(0);
+        const auto* src    = complete_token_ids.data_ptr<int32_t>();
+        const auto  nbytes = static_cast<size_t>(seq_len) * sizeof(int32_t);
+        for (int64_t row = 0; row < score_len; ++row) {
+            std::memcpy(dst, src, nbytes);
+            dst += token_ids.stride(0);
+        }
+        return;
+    }
+
+    auto dst = token_ids.narrow(0, batch_idx, score_len).narrow(1, 0, seq_len);
+    auto src = complete_token_ids.narrow(0, 0, 1).narrow(1, 0, seq_len).expand({score_len, seq_len});
+    dst.copy_(src);
+}
 
 absl::Status MtpBatchStreamProcessor::dispatchPrefill(const StreamGroups& stream_groups,
                                                       const MergedOutput& prefill_output,

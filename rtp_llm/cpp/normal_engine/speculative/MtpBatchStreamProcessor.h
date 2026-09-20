@@ -7,6 +7,13 @@
 
 namespace rtp_llm {
 
+// Replicate one stream's token history into its target-verify score rows.
+void copyScoreSamplerTokenIds(torch::Tensor&       token_ids,
+                              const torch::Tensor& complete_token_ids,
+                              int64_t              batch_idx,
+                              int64_t              score_len,
+                              int64_t              seq_len);
+
 class MtpBatchStreamProcessor: public NormalBatchStreamProcessor {
 public:
     MtpBatchStreamProcessor(const ModelConfig&                 model_config,
