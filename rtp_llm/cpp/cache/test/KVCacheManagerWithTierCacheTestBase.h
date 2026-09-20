@@ -24,7 +24,7 @@
 
 #include "rtp_llm/cpp/cache/CacheConfigCreator.h"
 #include "rtp_llm/cpp/cache/CPSlotMapper.h"
-#include "rtp_llm/cpp/cache/KVCacheGroup.h"
+#include "rtp_llm/cpp/cache/SingleTypeCacheManager.h"
 #include "rtp_llm/cpp/cache/KVCacheManager.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/test/BlockTreeCacheTestUtils.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/transfer/TransferBatchAsyncContext.h"
@@ -465,7 +465,7 @@ inline PoolSnapshot snapshotPool(const DeviceBlockPoolPtr& pool) {
 
 inline std::vector<PoolSnapshot> snapshotDevicePools(const std::shared_ptr<KVCacheManager>& manager) {
     std::vector<PoolSnapshot> snapshots;
-    const auto                groups = manager->allocator_->cacheGroups();
+    const auto                groups = manager->coordinator_manager_->cacheGroups();
     snapshots.reserve(groups.size());
     for (const auto& group : groups) {
         snapshots.push_back(snapshotPool(group->blockPool()));
@@ -616,11 +616,11 @@ expectDsv4TierTopology(const std::shared_ptr<KVCacheManager>& manager, const Cac
     ASSERT_EQ(publishedGroupTypes(config.topology()), kDsv4Types);
     ASSERT_EQ(config.linear_step, 1);
 
-    const auto allocator_groups = manager->allocator_->cacheGroups();
-    ASSERT_EQ(allocator_groups.size(), static_cast<size_t>(kDsv4GroupCount));
+    const auto coordinator_groups = manager->coordinator_manager_->cacheGroups();
+    ASSERT_EQ(coordinator_groups.size(), static_cast<size_t>(kDsv4GroupCount));
     std::unordered_set<const IBlockPool*> unique_device_pools;
     for (int group_id = 0; group_id < kDsv4GroupCount; ++group_id) {
-        const auto& group = allocator_groups[static_cast<size_t>(group_id)];
+        const auto& group = coordinator_groups[static_cast<size_t>(group_id)];
         ASSERT_NE(group, nullptr);
         // Subsequent pool snapshots retain this verified topology order.
         ASSERT_EQ(group->tag(), config.groupTags()[static_cast<size_t>(group_id)]);
@@ -661,10 +661,10 @@ expectDsv4TierTopology(const std::shared_ptr<KVCacheManager>& manager, const Cac
             const auto& tag = group_set->groupTags()[member_index];
             ASSERT_NE(std::find(kDsv4Tags.begin(), kDsv4Tags.end(), tag), kDsv4Tags.end());
             EXPECT_TRUE(config.group(tag).policy.enable_prefix_reuse);
-            const auto manager = std::find_if(allocator_groups.begin(),
-                                              allocator_groups.end(),
+            const auto manager = std::find_if(coordinator_groups.begin(),
+                                              coordinator_groups.end(),
                                               [&](const auto& group) { return group && group->tag() == tag; });
-            ASSERT_NE(manager, allocator_groups.end());
+            ASSERT_NE(manager, coordinator_groups.end());
             EXPECT_EQ(group_set->devicePools()[member_index].get(), (*manager)->blockPool().get());
             ++membership_count[tag];
         }
@@ -861,7 +861,7 @@ inline bool fillGroupBlockPayload(const std::shared_ptr<KVCacheManager>& manager
     if (manager == nullptr) {
         return false;
     }
-    const auto groups = manager->allocator_->cacheGroups();
+    const auto groups = manager->coordinator_manager_->cacheGroups();
     const auto group  = std::find_if(
         groups.begin(), groups.end(), [&](const auto& candidate) { return candidate && candidate->tag() == tag; });
     const auto& tags        = config.groupTags();
@@ -895,7 +895,7 @@ inline bool groupBlockPayloadMatches(const std::shared_ptr<KVCacheManager>& mana
     if (manager == nullptr) {
         return false;
     }
-    const auto groups = manager->allocator_->cacheGroups();
+    const auto groups = manager->coordinator_manager_->cacheGroups();
     const auto group  = std::find_if(
         groups.begin(), groups.end(), [&](const auto& candidate) { return candidate && candidate->tag() == tag; });
     const auto& tags        = config.groupTags();
@@ -923,7 +923,7 @@ fillSeedPayload(const std::shared_ptr<KVCacheManager>& manager, const CacheConfi
     if (manager == nullptr || seed.blocks_by_group.size() != static_cast<size_t>(config.groupNums())) {
         return false;
     }
-    const auto groups = manager->allocator_->cacheGroups();
+    const auto groups = manager->coordinator_manager_->cacheGroups();
     if (groups.size() != seed.blocks_by_group.size()) {
         return false;
     }
