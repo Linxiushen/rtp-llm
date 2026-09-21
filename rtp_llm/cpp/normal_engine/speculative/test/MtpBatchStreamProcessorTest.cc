@@ -414,7 +414,7 @@ TEST_F(MtpBatchStreamProcessorTest, testSpecSamplerInputMasksThinkBoundaryTokens
     ASSERT_FALSE(verify_task.active.empty());
     auto verify_result = verify_runner.buildInline(verify_task);
     ASSERT_TRUE(verify_result.has_active_processor);
-    ASSERT_TRUE(verify_result.spec_vocab_mask_gpu.defined());
+    ASSERT_TRUE(verify_result.packed_allow_mask_gpu.defined());
 
     auto sampler_inputs_status =
         processor.gatherSpecSamplerInput(stream_groups, model_input, model_output, verify_result);
