@@ -2088,6 +2088,45 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
     auto draft_tokens_ready_event = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
     draft_tokens_ready_event->record(cuda_graph::graphGetCurrentStream());
 
+    // Start host-side packed-mask construction as soon as draft tokens are
+    // ready. Its D2H/CPU/H2D work then overlaps target verification instead of
+    // being paid entirely by wait_spec_logits_verify_async afterward.
+    if (spec_logits_processor_present && propose_step_ > 1 && draft_token_ids_t.defined()) {
+        RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(launch_spec_logits_verify_async)");
+        if (join_bookkeeping_before_host_consumers) {
+            RTP_LLM_PROFILE_SCOPE_DYNAMIC(
+                "executor.mtp.decode_step(wait_prev_bookkeeping_pre_spec_logits,stream_count=%zu)", streams.size());
+            spec_bookkeeping_runner_.sync(cuda_graph::graphGetCurrentStream());
+            stream_groups                           = StreamGroups(streams);
+            prev_bookkeeping_synced_for_spec_logits = true;
+        }
+
+        auto spec_streams = streams;
+        auto draft_tokens = draft_token_ids_t;
+        spec_logits_verify_async_runner_.launch([this,
+                                                 spec_streams = std::move(spec_streams),
+                                                 draft_tokens,
+                                                 draft_tokens_ready_event,
+                                                 spec_logits_result]() mutable {
+            RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(spec_logits_verify_async_worker)");
+            try {
+                *spec_logits_result =
+                    buildSpecLogitsVerifyInline(spec_streams, draft_tokens, std::move(draft_tokens_ready_event));
+            } catch (const std::exception& e) {
+                RTP_LLM_LOG_ERROR("spec logits async worker failed: %s", e.what());
+                throw;
+            } catch (...) {
+                RTP_LLM_LOG_ERROR("spec logits async worker failed with unknown exception");
+                throw;
+            }
+        });
+        spec_logits_async_launched = true;
+    }
+
+    // Attention metadata does not depend on target hidden states or rejection
+    // output, so prepare it in parallel with target verify as main does.
+    launchDraftPrefillPrepareAsync(model_input);
+
     {
         int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
         model_input.linear_replay = target_linear_replay;
@@ -2143,38 +2182,6 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
                                                                            draft_probs_list);
             }
         }
-    }
-
-    if (spec_logits_processor_present && propose_step_ > 1 && draft_token_ids_t.defined()) {
-        RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(launch_spec_logits_verify_async)");
-        if (join_bookkeeping_before_host_consumers) {
-            RTP_LLM_PROFILE_SCOPE_DYNAMIC(
-                "executor.mtp.decode_step(wait_prev_bookkeeping_pre_spec_logits,stream_count=%zu)", streams.size());
-            spec_bookkeeping_runner_.sync(cuda_graph::graphGetCurrentStream());
-            stream_groups                           = StreamGroups(streams);
-            prev_bookkeeping_synced_for_spec_logits = true;
-        }
-
-        auto spec_streams = streams;
-        auto draft_tokens = draft_token_ids_t;
-        spec_logits_verify_async_runner_.launch([this,
-                                                 spec_streams = std::move(spec_streams),
-                                                 draft_tokens,
-                                                 draft_tokens_ready_event,
-                                                 spec_logits_result]() mutable {
-            RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(spec_logits_verify_async_worker)");
-            try {
-                *spec_logits_result =
-                    buildSpecLogitsVerifyInline(spec_streams, draft_tokens, std::move(draft_tokens_ready_event));
-            } catch (const std::exception& e) {
-                RTP_LLM_LOG_ERROR("spec logits async worker failed: %s", e.what());
-                throw;
-            } catch (...) {
-                RTP_LLM_LOG_ERROR("spec logits async worker failed with unknown exception");
-                throw;
-            }
-        });
-        spec_logits_async_launched = true;
     }
 
     if (spec_logits_processor_present && !spec_logits_async_launched) {
@@ -2310,12 +2317,9 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
     maybeOverrideLastHiddenWithMtpBuffer(model_input, *model_);
     broadcastPostRejectionInputs(model_input);
 
-    // Projection-KTP pads target verification to one common batch across its
-    // DP ranks. The following draft-update model is KTP1 but may still use EP,
-    // so it must inherit that exact physical batch before attention metadata is
-    // prepared. Preparing it from each rank's local logical batch would make
-    // EP collectives enter with different row counts (for example 2 vs 1).
-    launchDraftPrefillPrepareAsync(model_input);
+    // The prepare launched before target verify has completed by this join;
+    // model_input mutations below affect hidden/output tensors, not attention
+    // geometry captured by prepareAttentionInputs.
     draft_prefill_prepare_runner_.sync(cuda_graph::graphGetCurrentStream());
 
     {
