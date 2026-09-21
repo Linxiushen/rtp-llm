@@ -6,6 +6,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_set>
+#include <c10/core/InferenceMode.h>
 #include "rtp_llm/cpp/cuda_graph/cuda_graph_device_shims.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 #include "torch/csrc/autograd/generated/variable_factories.h"
@@ -791,7 +792,8 @@ void CudaGraphRunner::updateKVCacheKernelBlockId(const PyModelInputs& inputs, Cu
 }
 
 PyModelOutputs CudaGraphRunner::forward(const PyModelInputs& inputs, CudaGraphState& state) {
-    PyModelOutputs outputs;
+    c10::InferenceMode inference_guard(true);
+    PyModelOutputs     outputs;
 
     // RAII guard: ensure prepared_attention_inputs_ is always reset to false on scope exit,
     // even if forward() throws after async prepareAttentionInputs set it to true.
@@ -1207,6 +1209,8 @@ void CudaGraphRunner::logCudaGraphPoolMemory(const char* phase) {
 }
 
 void CudaGraphRunner::initCapture() {
+    c10::InferenceMode inference_guard(true);
+
     if (enable_cuda_graph_) {
         RTP_LLM_LOG_INFO("CUDA graph capture is enabled");
         shared_graph_pool_ = cuda_graph::graphPoolHandle();
